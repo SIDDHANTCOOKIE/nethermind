@@ -219,7 +219,7 @@ async Task RunClientAsync(CancellationToken stoppingToken)
     }
     using VerifiedCall calls = new(execution, execution.SpecProvider, logManager);
     using VerifiedRpc rpc = new(execution, GetHead, spec.ChainId, calls, execution.SpecProvider, GetLatestHead);
-    await using VerifiedSubscriptions subscriptions = new(execution, execution.SpecProvider, spec.ChainId, rpc, logger);
+    await using VerifiedSubscriptions subscriptions = new(execution, rpc, logger);
     app.MapPost("/", (HttpContext context) => RpcEndpoint.HandleAsync(context, rpc, logger));
     LightClientHost.ConfigureRequestPolicy(app, rpcUrl);
     app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(15), KeepAliveTimeout = TimeSpan.FromSeconds(15) });

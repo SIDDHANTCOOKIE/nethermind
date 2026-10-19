@@ -110,9 +110,8 @@ public class CheckpointSourceTests
         Assert.That(Directory.GetFiles(_directory, "*-checkpoint.json"), Is.Empty);
     }
 
-    [TestCase("{")]
-    [TestCase("null")]
-    public async Task Rejects_invalid_saved_json_without_fetching_a_replacement(string saved)
+    [Test]
+    public async Task Rejects_invalid_saved_json_without_fetching_a_replacement([Values("{", "null")] string saved)
     {
         Directory.CreateDirectory(_directory);
         await File.WriteAllTextAsync(Path.Combine(_directory, "hoodi-checkpoint.json"), saved);
@@ -158,10 +157,10 @@ public class CheckpointSourceTests
         }
     }
 
-    [TestCase("0x0")]
-    [TestCase("0x0000000000000000000000000000000000000000000000000000000000000000")]
-    [TestCase("0x6ac776d12a0f63834f8ebac4882ecc4ee863b2f0f349a765ab2058c92eb1804x")]
-    public void Rejects_invalid_checkpoint_roots(string root)
+    [Test]
+    public void Rejects_invalid_checkpoint_roots(
+        [Values("0x0", "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "0x6ac776d12a0f63834f8ebac4882ecc4ee863b2f0f349a765ab2058c92eb1804x")] string root)
     {
         using ResponseHandler handler = new(Finality(root));
         using HttpClient client = new(handler);
@@ -170,11 +169,9 @@ public class CheckpointSourceTests
         Assert.That(Directory.Exists(_directory), Is.False);
     }
 
-    [TestCase("http://example.org")]
-    [TestCase("https://user:password@example.org")]
-    [TestCase("https://example.org?token=secret")]
-    [TestCase("https://example.org#fragment")]
-    public void Rejects_invalid_provider_urls(string endpoint)
+    [Test]
+    public void Rejects_invalid_provider_urls(
+        [Values("http://example.org", "https://user:password@example.org", "https://example.org?token=secret", "https://example.org#fragment")] string endpoint)
     {
         using ResponseHandler handler = new("{}");
         using HttpClient client = new(handler);
@@ -183,13 +180,12 @@ public class CheckpointSourceTests
         Assert.That(handler.Requests, Is.Empty);
     }
 
-    [TestCase("{}")]
-    [TestCase("{\"data\":{\"finalized\":{\"root\":23}}}")]
-    [TestCase("{\"finalized\":false,\"execution_optimistic\":false,\"data\":{}}")]
-    [TestCase("{\"finalized\":true,\"execution_optimistic\":true,\"data\":{}}")]
-    [TestCase("{\"finalized\":true,\"execution_optimistic\":false,\"data\":{\"finalized\":{\"root\":\"0x01\",\"epoch\":\"-1\"}}}")]
-    [TestCase("[{}]")]
-    public void Rejects_invalid_finality_response(string body)
+    [Test]
+    public void Rejects_invalid_finality_response(
+        [Values("{}", "{\"data\":{\"finalized\":{\"root\":23}}}",
+            "{\"finalized\":false,\"execution_optimistic\":false,\"data\":{}}",
+            "{\"finalized\":true,\"execution_optimistic\":true,\"data\":{}}",
+            "{\"finalized\":true,\"execution_optimistic\":false,\"data\":{\"finalized\":{\"root\":\"0x01\",\"epoch\":\"-1\"}}}", "[{}]")] string body)
     {
         using ResponseHandler handler = new(body);
         using HttpClient client = new(handler);
@@ -256,9 +252,8 @@ public class CheckpointSourceTests
         Assert.That(Directory.Exists(_directory), Is.False);
     }
 
-    [TestCase(HttpStatusCode.Redirect)]
-    [TestCase(HttpStatusCode.ServiceUnavailable)]
-    public void Rejects_non_success_responses(HttpStatusCode status)
+    [Test]
+    public void Rejects_non_success_responses([Values(HttpStatusCode.Redirect, HttpStatusCode.ServiceUnavailable)] HttpStatusCode status)
     {
         using ResponseHandler handler = new("{}") { Status = status };
         using HttpClient client = new(handler);

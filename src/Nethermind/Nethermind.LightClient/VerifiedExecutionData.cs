@@ -24,6 +24,43 @@ internal sealed class VerifiedExecutionData(IExecutionStateSource source, ISpecP
     private readonly EthereumEcdsa _ecdsa = new(chainId);
     private readonly MemoryCache _transactionIndex = new(new MemoryCacheOptions { SizeLimit = 32_768 });
 
+    internal JsonElement GetHeader(BlockHeader header)
+    {
+        IReleaseSpec spec = specProvider.GetSpec(header);
+        Dictionary<string, object?> result = new()
+        {
+            ["difficulty"] = header.Difficulty,
+            ["extraData"] = header.ExtraData,
+            ["gasLimit"] = header.GasLimit,
+            ["gasUsed"] = header.GasUsed,
+            ["hash"] = header.Hash,
+            ["logsBloom"] = header.Bloom,
+            ["miner"] = header.Beneficiary,
+            ["nonce"] = $"0x{header.Nonce:x16}",
+            ["number"] = header.Number,
+            ["parentHash"] = header.ParentHash,
+            ["receiptsRoot"] = header.ReceiptsRoot,
+            ["sha3Uncles"] = header.UnclesHash,
+            ["stateRoot"] = header.StateRoot,
+            ["timestamp"] = header.Timestamp,
+            ["transactionsRoot"] = header.TxRoot,
+        };
+        if (header.MixHash is not null) result["mixHash"] = header.MixHash;
+        if (spec.IsEip1559Enabled) result["baseFeePerGas"] = header.BaseFeePerGas;
+        if (header.WithdrawalsRoot is not null) result["withdrawalsRoot"] = header.WithdrawalsRoot;
+        if (header.RequestsHash is not null) result["requestsHash"] = header.RequestsHash;
+        if (header.BlockAccessListHash is not null) result["blockAccessListHash"] = header.BlockAccessListHash;
+        if (spec.IsEip4844Enabled)
+        {
+            if (header.BlobGasUsed is not null) result["blobGasUsed"] = header.BlobGasUsed;
+            if (header.ExcessBlobGas is not null) result["excessBlobGas"] = header.ExcessBlobGas;
+        }
+        if (spec.IsEip4788Enabled && header.ParentBeaconBlockRoot is not null)
+            result["parentBeaconBlockRoot"] = header.ParentBeaconBlockRoot;
+        if (spec.IsEip7843Enabled && header.SlotNumber is not null) result["slotNumber"] = header.SlotNumber;
+        return BoundedJson.ToElement(result);
+    }
+
     internal async Task<JsonElement> GetBlockAsync(BlockHeader header, bool fullTransactions, CancellationToken cancellationToken)
     {
         Block block = await source.GetBlockAsync(header, cancellationToken);
@@ -76,22 +113,45 @@ internal sealed class VerifiedExecutionData(IExecutionStateSource source, ISpecP
         foreach (BlockHeader header in headers)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (!MayContainLogs(header.Bloom, addresses, topics)) continue;
             Block block = await source.GetBlockAsync(header, cancellationToken);
             Index(block);
             TxReceipt[] receipts = await source.GetReceiptsAsync(block, cancellationToken);
-            ReceiptForRpc[] rendered = BuildReceipts(block, receipts);
-            foreach (ReceiptForRpc receipt in rendered)
+            if (receipts.Length != block.Transactions.Length)
+                throw new InvalidDataException("Verified receipt count does not match the block transaction count.");
+            ulong previousGas = 0;
+            int logIndex = 0;
+            for (int i = 0; i < receipts.Length; i++)
             {
-                if (receipt.Logs is null) continue;
-                foreach (LogEntryForRpc log in receipt.Logs)
+                cancellationToken.ThrowIfCancellationRequested();
+                TxReceipt receipt = receipts[i];
+                Transaction transaction = block.Transactions[i];
+                if (receipt.TxType != transaction.Type || receipt.GasUsedTotal < previousGas)
+                    throw new InvalidDataException("Verified receipt has inconsistent transaction type or cumulative gas.");
+                previousGas = receipt.GasUsedTotal;
+                foreach (LogEntry log in receipt.Logs ?? [])
                 {
+                    int index = logIndex;
+                    logIndex = checked(logIndex + 1);
                     if (addresses is not null && !addresses.Contains(log.Address)) continue;
                     if (!MatchesTopics(log.Topics, topics)) continue;
                     if (result.Count >= 10_000)
                         throw new RpcException(-32001, "Verified log query exceeds the 10000-log response limit.");
                     payloadBytes += log.Data.LongLength * 2 + 4 + log.Topics.LongLength * 68;
                     if (payloadBytes > BoundedJson.ResultLimit) throw BoundedJson.TooLarge();
-                    result.Add(log);
+                    result.Add(new LogEntryForRpc
+                    {
+                        Removed = false,
+                        LogIndex = index,
+                        TransactionIndex = i,
+                        TransactionHash = transaction.Hash!,
+                        BlockHash = header.Hash!,
+                        BlockNumber = header.Number,
+                        BlockTimestamp = header.Timestamp,
+                        Address = log.Address,
+                        Data = log.Data,
+                        Topics = log.Topics,
+                    });
                 }
             }
         }
@@ -343,6 +403,27 @@ internal sealed class VerifiedExecutionData(IExecutionStateSource source, ISpecP
         if (actual.Length < filter.Count) return false;
         for (int i = 0; i < filter.Count; i++)
             if (filter[i] is { } choices && !choices.Contains(actual[i])) return false;
+        return true;
+    }
+
+    private static bool MayContainLogs(Bloom? bloom, HashSet<Address>? addresses, IReadOnlyList<HashSet<Hash256>?> topics)
+    {
+        if (bloom is null || bloom.IsZeroLength) return true;
+        if (addresses is not null)
+        {
+            bool matches = false;
+            foreach (Address address in addresses)
+                if (bloom.Matches(address.Bytes)) { matches = true; break; }
+            if (!matches) return false;
+        }
+        foreach (HashSet<Hash256>? choices in topics)
+        {
+            if (choices is null) continue;
+            bool matches = false;
+            foreach (Hash256 topic in choices)
+                if (bloom.Matches(topic.Bytes)) { matches = true; break; }
+            if (!matches) return false;
+        }
         return true;
     }
 

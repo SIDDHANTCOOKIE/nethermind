@@ -234,6 +234,7 @@ public class VerifiedRpcTests
         provider.Header.ReceiptsRoot = ReceiptTrie.CalculateRoot(MainnetSpecProvider.Instance.GetSpec(provider.Header),
             provider.Receipts, new ReceiptMessageDecoder());
         provider.Header.GasUsed = (ulong)((long)receipt.GasUsedTotal + headerGasOffset);
+        provider.Header.Bloom = new Bloom(receipt.Logs);
 
         JsonElement tx = (JsonElement)await provider.Rpc.InvokeAsync("eth_getTransactionByBlockHashAndIndex",
             Parameters(BlockHash.ToString(), "0x0"), CancellationToken.None);
@@ -264,6 +265,119 @@ public class VerifiedRpcTests
 
         provider.Header.ReceiptsRoot = Keccak.Compute("forged receipts");
         await AssertRpcErrorAsync(provider, "eth_getBlockReceipts", Parameters("finalized"), -32000);
+    }
+
+    [Test]
+    public async Task Filtered_logs_keep_block_coordinates_without_recovering_senders([Values] bool withoutBloom)
+    {
+        Hash256 topic = Keccak.Compute("matching log topic");
+        Hash256 otherTopic = Keccak.Compute("other log topic");
+        using Provider provider = LogsProvider(
+            [new LogEntry(AccountAddress, [], [otherTopic]), new LogEntry(Address.Zero, [], [topic])],
+            [new LogEntry(AccountAddress, [], []), new LogEntry(AccountAddress, [0xab], [otherTopic, topic])]);
+        if (withoutBloom) provider.Header.Bloom = Bloom.ZeroLength;
+
+        JsonElement logs = (JsonElement)await provider.Rpc.InvokeAsync("eth_getLogs", Parameters(new
+        {
+            blockHash = BlockHash.ToString(),
+            address = AccountAddress.ToString(),
+            topics = new object?[] { null, topic.ToString() },
+        }), CancellationToken.None);
+
+        Assert.That(logs.GetArrayLength(), Is.EqualTo(1));
+        JsonElement log = logs[0];
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(log.GetProperty("logIndex").GetString(), Is.EqualTo("0x3"));
+            Assert.That(log.GetProperty("transactionIndex").GetString(), Is.EqualTo("0x1"));
+            Assert.That(log.GetProperty("transactionHash").GetString(), Is.EqualTo(provider.Transactions[1].Hash!.ToString()));
+            Assert.That(log.GetProperty("blockHash").GetString(), Is.EqualTo(BlockHash.ToString()));
+            Assert.That(log.GetProperty("blockNumber").GetString(), Is.EqualTo("0xa"));
+            Assert.That(log.GetProperty("blockTimestamp").GetString(), Is.EqualTo("0x6553f100"));
+            Assert.That(log.GetProperty("removed").GetBoolean(), Is.False);
+            Assert.That(log.GetProperty("address").GetString(), Is.EqualTo(AccountAddress.ToString()));
+            Assert.That(log.GetProperty("data").GetString(), Is.EqualTo("0xab"));
+            Assert.That(log.GetProperty("topics")[1].GetString(), Is.EqualTo(topic.ToString()));
+            Assert.That(provider.Transactions.All(transaction => transaction.SenderAddress is null), Is.True);
+            Assert.That(provider.BlockFetches, Is.EqualTo(1));
+            Assert.That(provider.ReceiptFetches, Is.EqualTo(1));
+        }
+    }
+
+    [Test]
+    public async Task Negative_authenticated_bloom_skips_execution_data([Values] bool filterTopic)
+    {
+        using Provider provider = LogsProvider([new LogEntry(AccountAddress, [], [Keccak.Compute("present topic")])]);
+        object filter = filterTopic
+            ? new { blockHash = BlockHash.ToString(), topics = new[] { Keccak.Compute("absent topic").ToString() } }
+            : new { blockHash = BlockHash.ToString(), address = Address.Zero.ToString() };
+
+        JsonElement logs = (JsonElement)await provider.Rpc.InvokeAsync("eth_getLogs", Parameters(filter), CancellationToken.None);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(logs.GetArrayLength(), Is.Zero);
+            Assert.That(provider.BlockFetches, Is.Zero);
+            Assert.That(provider.ReceiptFetches, Is.Zero);
+        }
+    }
+
+    [Test]
+    public async Task Bloom_candidates_still_verify_and_filter_receipts([Values] bool tamper)
+    {
+        Hash256 topic = Keccak.Compute("candidate topic");
+        using Provider provider = LogsProvider(
+            [new LogEntry(AccountAddress, [], [Keccak.Compute("other topic")]), new LogEntry(Address.Zero, [], [topic])]);
+        if (tamper) provider.Header.ReceiptsRoot = Keccak.Compute("forged receipts");
+        JsonElement parameters = Parameters(new
+        {
+            blockHash = BlockHash.ToString(),
+            address = AccountAddress.ToString(),
+            topics = new[] { topic.ToString() },
+        });
+
+        if (tamper)
+            await AssertRpcErrorAsync(provider, "eth_getLogs", parameters, -32000);
+        else
+        {
+            JsonElement logs = (JsonElement)await provider.Rpc.InvokeAsync("eth_getLogs", parameters, CancellationToken.None);
+            Assert.That(logs.GetArrayLength(), Is.Zero, "bloom membership does not establish a matching log");
+        }
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(provider.BlockFetches, Is.EqualTo(1));
+            Assert.That(provider.ReceiptFetches, Is.EqualTo(1));
+            Assert.That(provider.Transactions[0].SenderAddress, Is.Null);
+        }
+    }
+
+    private static Provider LogsProvider(params LogEntry[][] logs)
+    {
+        Provider provider = new(new Account(7, 123));
+        using PrivateKey key = new("0x0000000000000000000000000000000000000000000000000000000000000001");
+        provider.Transactions = new Transaction[logs.Length];
+        provider.Receipts = new TxReceipt[logs.Length];
+        for (int i = 0; i < logs.Length; i++)
+        {
+            Transaction transaction = new() { Nonce = (ulong)i, GasLimit = 50_000, GasPrice = 2, To = AccountAddress };
+            new EthereumEcdsa(1).Sign(key, transaction, isEip155Enabled: true);
+            transaction.Hash = transaction.CalculateHash();
+            transaction.SenderAddress = null;
+            provider.Transactions[i] = transaction;
+            provider.Receipts[i] = new TxReceipt
+            {
+                TxType = transaction.Type,
+                StatusCode = 1,
+                GasUsedTotal = (ulong)((i + 1) * 21_000),
+                Logs = logs[i],
+            };
+        }
+        provider.Header.TxRoot = TxTrie.CalculateRoot(provider.Transactions);
+        provider.Header.ReceiptsRoot = ReceiptTrie.CalculateRoot(MainnetSpecProvider.Instance.GetSpec(provider.Header),
+            provider.Receipts, new ReceiptMessageDecoder());
+        provider.Header.GasUsed = (ulong)(logs.Length * 21_000);
+        provider.Header.Bloom = new Bloom(logs.SelectMany(entries => entries).ToArray());
+        return provider;
     }
 
     [Test]
@@ -821,6 +935,7 @@ public class VerifiedRpcTests
         public Transaction[] Transactions { get; set; } = [];
         public TxReceipt[] Receipts { get; set; } = [];
         public int BlockFetches { get; private set; }
+        public int ReceiptFetches { get; private set; }
         public TaskCompletionSource? BlockGate { get; set; }
         public VerifiedHead? LastQueriedHead { get; private set; }
         public List<(string Kind, Hash256? BlockHash)> Requests { get; } = [];
@@ -927,6 +1042,7 @@ public class VerifiedRpcTests
         }
         public Task<TxReceipt[]> GetReceiptsAsync(Block block, CancellationToken cancellationToken)
         {
+            ReceiptFetches++;
             ExecutionPeerTransport.VerifyReceipts(block.Header, Receipts, MainnetSpecProvider.Instance);
             return Task.FromResult(Receipts);
         }

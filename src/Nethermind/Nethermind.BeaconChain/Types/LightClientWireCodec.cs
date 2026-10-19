@@ -6,9 +6,15 @@ using Nethermind.BeaconChain.Spec;
 
 namespace Nethermind.BeaconChain.Types;
 
-/// <summary>Encodes and decodes light-client data using the format selected by its attested slot.</summary>
+/// <summary>Encodes and decodes Electra/Fulu and Gloas light-client SSZ data.</summary>
+/// <remarks>Wire-format checks do not verify signatures, Merkle proofs or consensus validity.</remarks>
 public static class LightClientWireCodec
 {
+    /// <summary>Encodes a bootstrap using the fork format selected by its beacon header slot.</summary>
+    /// <param name="value">The bootstrap to encode.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The Electra/Fulu or Gloas SSZ encoding.</returns>
+    /// <exception cref="InvalidDataException">The bootstrap has no beacon header, or its header format disagrees with the fork at its slot.</exception>
     public static byte[] EncodeBootstrap(LightClientBootstrap value, BeaconChainSpec spec) =>
         IsGloas(value.Header, spec) ? GloasLightClientBootstrap.Encode(new GloasLightClientBootstrap
         {
@@ -17,6 +23,12 @@ public static class LightClientWireCodec
             CurrentSyncCommitteeBranch = value.CurrentSyncCommitteeBranch,
         }) : LightClientBootstrap.Encode(value);
 
+    /// <summary>Decodes a canonical bootstrap using the fork format required by its beacon header slot.</summary>
+    /// <param name="bytes">The complete Electra/Fulu or Gloas SSZ bootstrap.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The decoded bootstrap with its header format identified.</returns>
+    /// <remarks>Checks fork consistency and byte-for-byte canonical re-encoding; cryptographic verification is separate.</remarks>
+    /// <exception cref="InvalidDataException">Neither wire format is valid for the header slot, or both formats are accepted.</exception>
     public static LightClientBootstrap DecodeBootstrap(ReadOnlySpan<byte> bytes, BeaconChainSpec spec) => Decode(
         bytes, spec,
         static data => { LightClientBootstrap.Decode(data, out LightClientBootstrap value); return value; },
@@ -32,6 +44,11 @@ public static class LightClientWireCodec
         },
         static value => value.Header, EncodeBootstrap);
 
+    /// <summary>Encodes an update using the fork format selected by its attested beacon header slot.</summary>
+    /// <param name="value">The update to encode.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The Electra/Fulu or Gloas SSZ encoding.</returns>
+    /// <exception cref="InvalidDataException">The update has no attested beacon header, or its header format disagrees with the fork at its slot.</exception>
     public static byte[] EncodeUpdate(LightClientUpdate value, BeaconChainSpec spec) =>
         IsGloas(value.AttestedHeader, spec) ? GloasLightClientUpdate.Encode(new GloasLightClientUpdate
         {
@@ -44,6 +61,12 @@ public static class LightClientWireCodec
             SignatureSlot = value.SignatureSlot,
         }) : LightClientUpdate.Encode(value);
 
+    /// <summary>Decodes a canonical update using the fork format required by its attested beacon header slot.</summary>
+    /// <param name="bytes">The complete Electra/Fulu or Gloas SSZ update.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The decoded update with its header formats identified.</returns>
+    /// <remarks>Checks fork consistency and byte-for-byte canonical re-encoding; cryptographic verification is separate.</remarks>
+    /// <exception cref="InvalidDataException">Neither wire format is valid for the attested header slot, or both formats are accepted.</exception>
     public static LightClientUpdate DecodeUpdate(ReadOnlySpan<byte> bytes, BeaconChainSpec spec) => Decode(
         bytes, spec,
         static data => { LightClientUpdate.Decode(data, out LightClientUpdate value); return value; },
@@ -63,6 +86,11 @@ public static class LightClientWireCodec
         },
         static value => value.AttestedHeader, EncodeUpdate);
 
+    /// <summary>Encodes a finality update using the fork format selected by its attested beacon header slot.</summary>
+    /// <param name="value">The finality update to encode.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The Electra/Fulu or Gloas SSZ encoding.</returns>
+    /// <exception cref="InvalidDataException">The update has no attested beacon header, or its header format disagrees with the fork at its slot.</exception>
     public static byte[] EncodeFinality(LightClientFinalityUpdate value, BeaconChainSpec spec) =>
         IsGloas(value.AttestedHeader, spec) ? GloasLightClientFinalityUpdate.Encode(new GloasLightClientFinalityUpdate
         {
@@ -73,6 +101,12 @@ public static class LightClientWireCodec
             SignatureSlot = value.SignatureSlot,
         }) : LightClientFinalityUpdate.Encode(value);
 
+    /// <summary>Decodes a canonical finality update using the fork format required by its attested beacon header slot.</summary>
+    /// <param name="bytes">The complete Electra/Fulu or Gloas SSZ finality update.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The decoded finality update with its header formats identified.</returns>
+    /// <remarks>Checks fork consistency and byte-for-byte canonical re-encoding; cryptographic verification is separate.</remarks>
+    /// <exception cref="InvalidDataException">Neither wire format is valid for the attested header slot, or both formats are accepted.</exception>
     public static LightClientFinalityUpdate DecodeFinality(ReadOnlySpan<byte> bytes, BeaconChainSpec spec) => Decode(
         bytes, spec,
         static data => { LightClientFinalityUpdate.Decode(data, out LightClientFinalityUpdate value); return value; },
@@ -90,6 +124,11 @@ public static class LightClientWireCodec
         },
         static value => value.AttestedHeader, EncodeFinality);
 
+    /// <summary>Encodes an optimistic update using the fork format selected by its attested beacon header slot.</summary>
+    /// <param name="value">The optimistic update to encode.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The Electra/Fulu or Gloas SSZ encoding.</returns>
+    /// <exception cref="InvalidDataException">The update has no attested beacon header, or its header format disagrees with the fork at its slot.</exception>
     public static byte[] EncodeOptimistic(LightClientOptimisticUpdate value, BeaconChainSpec spec) =>
         IsGloas(value.AttestedHeader, spec) ? GloasLightClientOptimisticUpdate.Encode(new GloasLightClientOptimisticUpdate
         {
@@ -98,6 +137,12 @@ public static class LightClientWireCodec
             SignatureSlot = value.SignatureSlot,
         }) : LightClientOptimisticUpdate.Encode(value);
 
+    /// <summary>Decodes a canonical optimistic update using the fork format required by its attested beacon header slot.</summary>
+    /// <param name="bytes">The complete Electra/Fulu or Gloas SSZ optimistic update.</param>
+    /// <param name="spec">The chain specification containing the Gloas activation epoch.</param>
+    /// <returns>The decoded optimistic update with its header format identified.</returns>
+    /// <remarks>Checks fork consistency and byte-for-byte canonical re-encoding; cryptographic verification is separate.</remarks>
+    /// <exception cref="InvalidDataException">Neither wire format is valid for the attested header slot, or both formats are accepted.</exception>
     public static LightClientOptimisticUpdate DecodeOptimistic(ReadOnlySpan<byte> bytes, BeaconChainSpec spec) => Decode(
         bytes, spec,
         static data => { LightClientOptimisticUpdate.Decode(data, out LightClientOptimisticUpdate value); return value; },

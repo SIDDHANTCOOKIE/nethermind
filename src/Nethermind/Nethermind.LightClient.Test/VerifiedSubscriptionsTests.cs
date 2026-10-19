@@ -11,6 +11,7 @@ using Nethermind.Core;
 using Nethermind.Core.Crypto;
 using Nethermind.Core.Specs;
 using Nethermind.Crypto;
+using Nethermind.Facade.Eth;
 using Nethermind.Int256;
 using Nethermind.Serialization.Rlp;
 using Nethermind.Specs;
@@ -49,6 +50,122 @@ public class VerifiedSubscriptionsTests
         harness.Publish(harness.Source.Add(12, next, 1));
         Assert.That((await socket.Request("eth_chainId")).GetProperty("result").GetString(), Is.EqualTo("0x1"));
         Assert.That(socket.Output.Reader.TryRead(out _), Is.False);
+    }
+
+    [Test]
+    public async Task Head_notifications_preserve_fields_without_downloading_a_body(
+        [Values] bool logs, [Values(1_700_000_000UL, 1_800_000_000UL)] ulong timestamp)
+    {
+        await using Harness harness = new();
+        FakeSocket socket = harness.Connect();
+        await socket.Request("eth_subscribe", "newHeads");
+        if (logs) await socket.Request("eth_subscribe", "logs");
+        harness.Source.RejectBlocks = !logs;
+        Block next = harness.Source.Add(11, harness.Source.Current, 1, timestamp: timestamp);
+
+        harness.Publish(next);
+
+        if (logs) AssertLog(await socket.Next(), next.Hash!, false);
+        JsonElement head = (await socket.Next()).GetProperty("params").GetProperty("result");
+        JsonElement block = BoundedJson.ToElement(new BlockForRpc(next, false, MainnetSpecProvider.Instance));
+        Dictionary<string, string> expected = block.EnumerateObject()
+            .Where(property => property.Name is not ("transactions" or "uncles" or "withdrawals" or "size" or "totalDifficulty"))
+            .ToDictionary(property => property.Name, property => property.Value.GetRawText());
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(head.EnumerateObject().ToDictionary(property => property.Name, property => property.Value.GetRawText()), Is.EquivalentTo(expected));
+            Assert.That(harness.Source.HeaderReads, Is.EqualTo(1), "the authenticated header is fetched once");
+            Assert.That(harness.Source.BlockReads, Is.EqualTo(logs ? 1 : 0), "only logs require a body");
+            Assert.That(harness.Source.ReceiptReads, Is.EqualTo(logs ? 1 : 0));
+        }
+    }
+
+    [Test]
+    public async Task Subscription_logs_wait_for_external_admission_while_new_external_reads_are_rejected([Values] bool cancel)
+    {
+        using Source source = new();
+        using VerifiedRpc rpc = new(source, () => Harness.Head(source.Current), 1, specProvider: MainnetSpecProvider.Instance);
+        await using ExecutionLoad load = new();
+        await load.Entered;
+        JsonElement parameters = JsonSerializer.SerializeToElement(new object[] { source.Current.Hash!.ToString(), false });
+        using CancellationTokenSource cancellation = new();
+
+        Task<JsonElement> logs = rpc.GetSubscriptionLogsAsync(source.Current.Header, cancellation.Token);
+        Assert.That(logs.IsCompleted, Is.False);
+        RpcException? rejected = await Assert.ThrowsAsync<RpcException>(async () => await rpc.InvokeAsync("eth_getBlockByHash", parameters, CancellationToken.None));
+        Assert.That(rejected!.Code, Is.EqualTo(-32005));
+        if (cancel)
+        {
+            await cancellation.CancelAsync();
+            await Assert.ThatAsync(async () => { await logs; }, Throws.InstanceOf<OperationCanceledException>());
+        }
+        await load.ReleaseAsync();
+
+        if (!cancel)
+        {
+            JsonElement result = await logs.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(result[0].GetProperty("blockHash").GetString(), Is.EqualTo(source.Current.Hash!.ToString()));
+        }
+    }
+
+    [Test]
+    public async Task External_execution_reads_do_not_disconnect_subscriptions_or_erase_reorganization_history()
+    {
+        await using Harness harness = new();
+        Block common = harness.Source.Current;
+        FakeSocket socket = harness.Connect();
+        await socket.Request("eth_subscribe", "newHeads");
+        await socket.Request("eth_subscribe", "logs");
+        Block first = harness.Source.Add(11, common, 1);
+        harness.Publish(first);
+        AssertLog(await socket.Next(), first.Hash!, false);
+        await socket.Next();
+
+        await using ExecutionLoad load = new();
+        await load.Entered;
+        TaskCompletionSource headerRequested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Block second = harness.Source.Add(12, first, 1);
+        harness.Source.HeaderRequested = header => { if (header.Hash == second.Hash) headerRequested.TrySetResult(); };
+        harness.Publish(second);
+        await headerRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await load.ReleaseAsync();
+        AssertLog(await socket.Next(), second.Hash!, false);
+        Assert.That((await socket.Next()).GetProperty("params").GetProperty("result").GetProperty("hash").GetString(), Is.EqualTo(second.Hash!.ToString()));
+
+        Block replacement = harness.Source.Add(11, common, 2);
+        harness.Publish(replacement);
+        AssertLog(await socket.Next(), second.Hash!, true);
+        AssertLog(await socket.Next(), first.Hash!, true);
+        AssertLog(await socket.Next(), replacement.Hash!, false);
+        Assert.That((await socket.Next()).GetProperty("params").GetProperty("result").GetProperty("hash").GetString(), Is.EqualTo(replacement.Hash!.ToString()));
+        Assert.That(socket.State, Is.EqualTo(WebSocketState.Open));
+    }
+
+    [Test]
+    public async Task Publisher_cancellation_or_failure_releases_execution_admission(
+        [Values("deadline", "shutdown", "receipts")] string termination)
+    {
+        WriteClock clock = new();
+        await using Harness harness = new(clock);
+        FakeSocket socket = harness.Connect();
+        await socket.Request("eth_subscribe", "logs");
+        await using (ExecutionLoad load = new())
+        {
+            await load.Entered;
+            clock.ObservePublication = true;
+            if (termination == "receipts") harness.Source.TamperReceipts = true;
+            harness.Publish(harness.Source.Add(11, harness.Source.Current, 1));
+            await clock.Created.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            if (termination == "deadline") clock.Expire();
+            else if (termination == "shutdown") await harness.StopAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            else await load.ReleaseAsync();
+
+            await socket.Aborted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.That(socket.Output.Reader.TryRead(out _), Is.False);
+        }
+
+        await using ExecutionLoad subsequent = new();
+        await subsequent.Entered;
     }
 
     [Test]
@@ -355,7 +472,7 @@ public class VerifiedSubscriptionsTests
         internal Harness(TimeProvider? clock = null)
         {
             _rpc = new(Source, () => Head(Source.Current), 1, specProvider: MainnetSpecProvider.Instance, getLatestHead: () => Head(Source.Current));
-            _subscriptions = new(Source, MainnetSpecProvider.Instance, 1, _rpc, NullLogger.Instance, clock);
+            _subscriptions = new(Source, _rpc, NullLogger.Instance, clock);
             _subscriptions.PublishHead(Head(Source.Current));
         }
 
@@ -375,6 +492,8 @@ public class VerifiedSubscriptionsTests
             _subscriptions.PublishHead(Head(block));
         }
 
+        internal Task StopAsync() => _subscriptions.DisposeAsync().AsTask();
+
         public async ValueTask DisposeAsync()
         {
             await _subscriptions.DisposeAsync();
@@ -383,19 +502,55 @@ public class VerifiedSubscriptionsTests
             Source.Dispose();
         }
 
-        private static VerifiedHead Head(Block block) => new(100, block.Number, block.Hash!, block.StateRoot!);
+        internal static VerifiedHead Head(Block block) => new(100, block.Number, block.Hash!, block.StateRoot!);
+    }
+
+    private sealed class ExecutionLoad : IAsyncDisposable
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Source _source;
+        private readonly VerifiedRpc _rpc;
+        private readonly Task<object>[] _requests;
+        internal Task Entered => _source.BlocksStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        internal ExecutionLoad()
+        {
+            _source = new() { BlockGate = _release };
+            _rpc = new(_source, () => Harness.Head(_source.Current), 1, specProvider: MainnetSpecProvider.Instance,
+                getLatestHead: () => Harness.Head(_source.Current));
+            JsonElement parameters = JsonSerializer.SerializeToElement(new object[] { _source.Current.Hash!.ToString(), false });
+            _requests = Enumerable.Range(0, 4).Select(_ => _rpc.InvokeAsync("eth_getBlockByHash", parameters, CancellationToken.None)).ToArray();
+        }
+
+        internal async Task ReleaseAsync()
+        {
+            _source.BlockGate = null;
+            _release.TrySetResult();
+            await Task.WhenAll(_requests);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try { await ReleaseAsync(); }
+            finally
+            {
+                _rpc.Dispose();
+                _source.Dispose();
+            }
+        }
     }
 
     private sealed class WriteClock : TimeProvider
     {
         internal bool ObserveWrites { get; set; }
+        internal bool ObservePublication { get; set; }
         internal TaskCompletionSource Created { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private Timer? _timer;
 
         public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
         {
             Timer timer = new(callback, state);
-            if (ObserveWrites && dueTime == TimeSpan.FromSeconds(10))
+            if (ObserveWrites && dueTime == TimeSpan.FromSeconds(10) || ObservePublication && dueTime == TimeSpan.FromSeconds(90))
             {
                 _timer = timer;
                 Created.TrySetResult();
@@ -492,11 +647,22 @@ public class VerifiedSubscriptionsTests
         internal bool TamperReceipts { get; set; }
         internal byte[] Code { get; set; } = [];
         internal Action<int>? BeforeCodeResponse { get; set; }
+        internal Action<BlockHeader>? HeaderRequested { get; set; }
+        internal bool RejectBlocks { get; set; }
+        internal TaskCompletionSource? BlockGate { get; set; }
+        internal TaskCompletionSource BlocksStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal int HeaderReads => Volatile.Read(ref _headerReads);
+        internal int BlockReads => Volatile.Read(ref _blockReads);
+        internal int ReceiptReads => Volatile.Read(ref _receiptReads);
         private int _codeCalls;
+        private int _headerReads;
+        private int _blockReads;
+        private int _receiptReads;
+        private int _blockedBlockReads;
 
         internal Source() => Current = Add(10, null, 0);
 
-        internal Block Add(ulong number, Block? parent, byte branch, int logCount = 1)
+        internal Block Add(ulong number, Block? parent, byte branch, int logCount = 1, ulong timestamp = 1_700_000_000)
         {
             Transaction transaction = new() { Nonce = number, GasLimit = 500_000, GasPrice = 2, To = Address, Value = 3 };
             new EthereumEcdsa(1).Sign(_key, transaction, isEip155Enabled: true);
@@ -511,14 +677,25 @@ public class VerifiedSubscriptionsTests
                 Logs = logs,
             };
             BlockHeader header = new(parent?.Hash ?? Hash256.Zero, Keccak.OfAnEmptySequenceRlp, Address.Zero,
-                UInt256.Zero, number, 30_000_000, 1_700_000_000 + number, [branch])
+                UInt256.Zero, number, 30_000_000, timestamp + number, [branch])
             {
                 StateRoot = Keccak.Compute("state" + number + ":" + branch),
                 TxRoot = TxTrie.CalculateRoot([transaction]),
                 WithdrawalsRoot = Keccak.EmptyTreeHash,
                 GasUsed = receipt.GasUsedTotal,
+                BaseFeePerGas = 17,
             };
-            header.ReceiptsRoot = ReceiptTrie.CalculateRoot(MainnetSpecProvider.Instance.GetSpec(header), [receipt], new ReceiptMessageDecoder());
+            IReleaseSpec spec = MainnetSpecProvider.Instance.GetSpec(header);
+            if (spec.IsEip4844Enabled)
+            {
+                header.BlobGasUsed = 0;
+                header.ExcessBlobGas = 131_072;
+            }
+            if (spec.IsEip4788Enabled) header.ParentBeaconBlockRoot = Keccak.Compute("beacon" + number);
+            if (spec.IsEip6110Enabled) header.RequestsHash = Keccak.OfAnEmptySequenceRlp;
+            if (spec.IsEip7928Enabled) header.BlockAccessListHash = Keccak.OfAnEmptySequenceRlp;
+            if (spec.IsEip7843Enabled) header.SlotNumber = number;
+            header.ReceiptsRoot = ReceiptTrie.CalculateRoot(spec, [receipt], new ReceiptMessageDecoder());
             header.Hash = Keccak.Compute(Rlp.Encode(header).Bytes);
             Block block = new(header, new BlockBody([transaction], [], []));
             _blocks.Add(header.Hash, (block, [receipt]));
@@ -534,20 +711,30 @@ public class VerifiedSubscriptionsTests
         }
         public Task<BlockHeader> GetHeaderAsync(VerifiedHead head, CancellationToken cancellationToken)
         {
+            Interlocked.Increment(ref _headerReads);
             BlockHeader header = _blocks[head.BlockHash].Block.Header;
             if (TamperHeader) header.Number++;
+            HeaderRequested?.Invoke(header);
             return Task.FromResult(header);
         }
         public Task<BlockHeader> GetHeaderByHashAsync(Hash256 hash, CancellationToken cancellationToken) => Task.FromResult(_blocks[hash].Block.Header);
         public Task<Hash256[]> GetAncestorHashesAsync(VerifiedHead head, ulong firstNumber, CancellationToken cancellationToken) => throw new NotSupportedException();
-        public Task<Block> GetBlockAsync(BlockHeader header, CancellationToken cancellationToken)
+        public async Task<Block> GetBlockAsync(BlockHeader header, CancellationToken cancellationToken)
         {
+            Interlocked.Increment(ref _blockReads);
+            if (RejectBlocks) throw new InvalidOperationException("A header subscription must not request a block body.");
+            if (BlockGate is { } gate)
+            {
+                if (Interlocked.Increment(ref _blockedBlockReads) == 4) BlocksStarted.TrySetResult();
+                await gate.Task.WaitAsync(cancellationToken);
+            }
             Block block = _blocks[header.Hash!].Block;
             ExecutionPeerTransport.VerifyBlockBody(header, block.Body);
-            return Task.FromResult(block);
+            return block;
         }
         public Task<TxReceipt[]> GetReceiptsAsync(Block block, CancellationToken cancellationToken)
         {
+            Interlocked.Increment(ref _receiptReads);
             TxReceipt[] receipts = _blocks[block.Hash!].Receipts;
             if (TamperReceipts) receipts[0].Logs![0].Data[0] ^= 1;
             ExecutionPeerTransport.VerifyReceipts(block.Header, receipts, MainnetSpecProvider.Instance);

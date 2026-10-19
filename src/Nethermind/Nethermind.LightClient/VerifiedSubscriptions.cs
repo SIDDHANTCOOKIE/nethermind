@@ -7,7 +7,6 @@ using System.Text.Json;
 using System.Threading.Channels;
 using Nethermind.Core;
 using Nethermind.Core.Crypto;
-using Nethermind.Core.Specs;
 using Nethermind.Serialization.Rlp;
 
 namespace Nethermind.LightClient;
@@ -22,8 +21,6 @@ internal sealed class VerifiedSubscriptions : IAsyncDisposable
     internal const int MaxQueuedBytes = 1024 * 1024;
     private const int MaxHistoryBytes = 16 * 1024 * 1024;
     private readonly IExecutionStateSource _source;
-    private readonly ISpecProvider _specProvider;
-    private readonly ulong _chainId;
     private readonly VerifiedRpc _rpc;
     private readonly ILogger _logger;
     private readonly TimeProvider _clock;
@@ -40,12 +37,10 @@ internal sealed class VerifiedSubscriptions : IAsyncDisposable
     private long _sequence;
     private bool _disposing;
 
-    internal VerifiedSubscriptions(IExecutionStateSource source, ISpecProvider specProvider, ulong chainId, VerifiedRpc rpc, ILogger logger,
+    internal VerifiedSubscriptions(IExecutionStateSource source, VerifiedRpc rpc, ILogger logger,
         TimeProvider? clock = null)
     {
         _source = source;
-        _specProvider = specProvider;
-        _chainId = chainId;
         _rpc = rpc;
         _logger = logger;
         _clock = clock ?? TimeProvider.System;
@@ -184,9 +179,9 @@ internal sealed class VerifiedSubscriptions : IAsyncDisposable
                         if (_history.Count > MaxHistory) _history.RemoveAt(0);
                         continue;
                     }
-                    using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(_stopping.Token);
-                    deadline.CancelAfter(TimeSpan.FromSeconds(90));
-                    await ProcessHeadAsync(head, sequence, clients, heads, logs, deadline.Token);
+                    using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(90), _clock);
+                    using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, _stopping.Token);
+                    await ProcessHeadAsync(head, sequence, clients, heads, logs, cancellation.Token);
                 }
                 catch (Exception exception) when (!_stopping.IsCancellationRequested)
                 {
@@ -231,14 +226,11 @@ internal sealed class VerifiedSubscriptions : IAsyncDisposable
         {
             BlockHeader header = branch[i];
             VerifiedHead anchor = new(header.Hash == head.BlockHash ? head.Slot : 0, header.Number, header.Hash!, header.StateRoot!);
-            using VerifiedRpc pinned = new(_source, () => anchor, _chainId, specProvider: _specProvider, getLatestHead: () => anchor);
             JsonElement rendered = default;
             if (needsHeads && i == 0)
-                rendered = Header((JsonElement)await pinned.InvokeAsync("eth_getBlockByHash",
-                    JsonSerializer.SerializeToElement(new object[] { anchor.BlockHash.ToString(), false }), cancellationToken));
+                rendered = _rpc.GetHeader(header);
             JsonElement logs = needsLogs
-                ? (JsonElement)await pinned.InvokeAsync("eth_getLogs",
-                    JsonSerializer.SerializeToElement(new[] { new { blockHash = anchor.BlockHash.ToString() } }), cancellationToken)
+                ? await _rpc.GetSubscriptionLogsAsync(header, cancellationToken)
                 : default;
             int bytes = Size(rendered) + Size(logs);
             encodedBytes = checked(encodedBytes + bytes);
@@ -253,10 +245,8 @@ internal sealed class VerifiedSubscriptions : IAsyncDisposable
         Snapshot? tip = needsHeads && added.Count != 0 ? added[^1] : null;
         if (needsHeads && added.Count == 0 && common >= 0)
         {
-            using VerifiedRpc pinned = new(_source, () => head, _chainId, specProvider: _specProvider, getLatestHead: () => head);
             JsonElement rendered = _history[common].Header.ValueKind == JsonValueKind.Undefined
-                ? Header((JsonElement)await pinned.InvokeAsync("eth_getBlockByHash",
-                    JsonSerializer.SerializeToElement(new object[] { head.BlockHash.ToString(), false }), cancellationToken))
+                ? _rpc.GetHeader(current)
                 : _history[common].Header;
             tip = _history[common] with { Sequence = sequence, Header = rendered };
         }
@@ -289,23 +279,6 @@ internal sealed class VerifiedSubscriptions : IAsyncDisposable
             result[index++] = new(value, new(value.GetProperty("address").GetString()!), topics);
         }
         return result;
-    }
-
-    private static JsonElement Header(JsonElement block)
-    {
-        using MemoryStream output = new();
-        using (Utf8JsonWriter writer = new(output))
-        {
-            writer.WriteStartObject();
-            foreach (JsonProperty property in block.EnumerateObject())
-            {
-                if (property.Name is "transactions" or "uncles" or "withdrawals" or "size" or "totalDifficulty") continue;
-                property.WriteTo(writer);
-            }
-            writer.WriteEndObject();
-        }
-        using JsonDocument document = JsonDocument.Parse(output.ToArray());
-        return document.RootElement.Clone();
     }
 
     private sealed record Snapshot(VerifiedHead Head, long Sequence, JsonElement Header, LogData[]? Logs, int Bytes);

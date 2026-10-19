@@ -20,6 +20,15 @@ internal sealed class VerifiedRpc(IExecutionStateSource execution, Func<Verified
     private readonly VerifiedExecutionData? _data = specProvider is null ? null : new(execution, specProvider, chainId);
     private readonly SemaphoreSlim _historicalStateRequests = new(2, 2);
 
+    internal JsonElement GetHeader(BlockHeader header) => _data!.GetHeader(header);
+
+    internal async Task<JsonElement> GetSubscriptionLogsAsync(BlockHeader header, CancellationToken cancellationToken)
+    {
+        await ActiveExecutionData.WaitAsync(cancellationToken);
+        try { return await _data!.GetLogsAsync([header], null, [], cancellationToken); }
+        finally { ActiveExecutionData.Release(); }
+    }
+
     internal async Task<object> InvokeAsync(string method, JsonElement parameters, CancellationToken cancellationToken)
     {
         bool data = method is "eth_getBlockByNumber" or "eth_getBlockByHash" or "eth_getBlockTransactionCountByNumber"

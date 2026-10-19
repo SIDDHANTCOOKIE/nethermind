@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 
 using System.Diagnostics.CodeAnalysis;
+using Autofac;
 using Microsoft.Extensions.Caching.Memory;
-using Nethermind.Blockchain;
+using Nethermind.Api;
 using Nethermind.Blockchain.Tracing;
+using Nethermind.Config;
 using Nethermind.Core;
 using Nethermind.Core.BlockAccessLists;
 using Nethermind.Core.Crypto;
@@ -16,10 +18,10 @@ using Nethermind.Evm.State;
 using Nethermind.Evm.TransactionProcessing;
 using Nethermind.Evm.Tracing;
 using Nethermind.Facade.Eth.RpcTransaction;
+using Nethermind.Init.Modules;
 using Nethermind.Int256;
 using Nethermind.Logging;
 using Nethermind.Serialization.Json;
-using Nethermind.State;
 
 namespace Nethermind.LightClient;
 
@@ -27,7 +29,25 @@ namespace Nethermind.LightClient;
 internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvider specs, ILogManager logs) : IDisposable
 {
     private const ulong GasCap = 10_000_000;
+    private const int CodeCacheCapacity = 256;
     private readonly MemoryCache _cache = new(new MemoryCacheOptions { SizeLimit = 32 * 1024 * 1024 });
+    private readonly ICodeCache _codeCache = new StaticCodeCache(CodeCacheCapacity);
+    private readonly IContainer _processing = new ContainerBuilder()
+        .AddModule(new BlockProcessingModule(new InitConfig(), new BlocksConfig()))
+        .AddSingleton<ISpecProvider>(specs)
+        .AddSingleton<ILogManager>(logs)
+        .AddScoped<IWorldStateScopeProvider, ILifetimeScope>(static scope =>
+        {
+            ExecutionState context = (ExecutionState)scope.Tag;
+            return new CallState(context.Head, context.Cache);
+        })
+        .AddScoped<IBlockhashProvider, ILifetimeScope>(static scope =>
+        {
+            ExecutionState context = (ExecutionState)scope.Tag;
+            return new VerifiedBlockhashes(context.Head, context.Cache);
+        })
+        .AddScoped<ICodeCache, ILifetimeScope>(static scope => ((ExecutionState)scope.Tag).CodeCache)
+        .Build();
     private readonly SemaphoreSlim _slots = new(4);
     private readonly EthereumJsonSerializer _json = new();
 
@@ -54,11 +74,13 @@ internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvide
         try
         {
             BlockHeader header = await GetHeaderAsync(head, token);
+            // A validation prefix can deposit code that is rolled back, so its code cache must not escape admission.
+            StaticCodeCache codeCache = new(CodeCacheCapacity);
             for (int attempt = 0; attempt < 128; attempt++)
             {
                 token.ThrowIfCancellationRequested();
-                CallState backend = new(head, _cache);
-                WorldState state = new(backend, logs);
+                using ILifetimeScope environment = CreateExecutionScope(head, codeCache);
+                IWorldState state = environment.Resolve<IWorldState>();
                 if (!state.TryBeginScope(header, out IDisposable? scope)) throw new RpcException(-32000, "Verified state is unavailable.");
                 using (scope)
                 {
@@ -72,7 +94,7 @@ internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvide
                         }
                         else if (transaction.Nonce < state.GetNonce(transaction.SenderAddress!))
                             throw new RpcException(-32003, "Frame transaction nonce is below authenticated state.");
-                        EthereumTransactionProcessor processor = CreateProcessor(head, state);
+                        ITransactionProcessor processor = environment.Resolve<ITransactionProcessor>();
                         BlockExecutionContext context = new(contextHeader, spec);
                         processor.SetBlockExecutionContext(in context);
                         TransactionResult result = processor.Process(transaction, NullTxTracer.Instance.WithCancellation(token),
@@ -88,13 +110,10 @@ internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvide
         finally { _slots.Release(); }
     }
 
-    private EthereumTransactionProcessor CreateProcessor(VerifiedHead head, WorldState state)
-    {
-        IBlockhashProvider blockhashes = new VerifiedBlockhashes(head, _cache);
-        EthereumVirtualMachine vm = new(blockhashes, specs, logs);
-        CodeInfoRepository code = new(state, new EthereumPrecompileProvider());
-        return new(BlobBaseFeeCalculator.Instance, specs, state, vm, code, logs);
-    }
+    private ILifetimeScope CreateExecutionScope(VerifiedHead head, ICodeCache? codeCache = null) =>
+        _processing.BeginLifetimeScope(new ExecutionState(head, _cache, codeCache ?? _codeCache));
+
+    private sealed record ExecutionState(VerifiedHead Head, MemoryCache Cache, ICodeCache CodeCache);
 
     private async Task<string> ExecuteCoreAsync(VerifiedHead head, System.Text.Json.JsonElement request, bool estimateGas, CancellationToken token)
     {
@@ -116,8 +135,8 @@ internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvide
         for (int attempt = 0; attempt < 128; attempt++)
         {
             token.ThrowIfCancellationRequested();
-            CallState backend = new(head, _cache);
-            WorldState state = new(backend, logs);
+            using ILifetimeScope environment = CreateExecutionScope(head);
+            IWorldState state = environment.Resolve<IWorldState>();
             if (!state.TryBeginScope(header, out IDisposable? scope)) throw new RpcException(-32000, "Verified state is unavailable.");
             using (scope)
             {
@@ -125,9 +144,10 @@ internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvide
                 {
                     if (tx.NonceKeys is null) tx.Nonce = state.GetNonce(tx.SenderAddress);
                     BlockHeader callHeader = header.Clone();
+                    if (!model.ShouldSetBaseFee()) callHeader.BaseFeePerGas = 0;
                     callHeader.IsPostMerge = true;
                     callHeader.BlobGasUsed = BlobGasCalculator.CalculateBlobGas(tx);
-                    EthereumTransactionProcessor processor = CreateProcessor(head, state);
+                    ITransactionProcessor processor = environment.Resolve<ITransactionProcessor>();
                     BlockExecutionContext context = new(callHeader, spec);
                     if (estimateGas)
                     {
@@ -226,6 +246,7 @@ internal sealed class VerifiedCall(IExecutionStateSource execution, ISpecProvide
 
     public void Dispose()
     {
+        _processing.Dispose();
         _slots.Dispose();
         _cache.Dispose();
     }

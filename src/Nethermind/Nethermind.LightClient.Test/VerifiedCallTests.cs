@@ -170,6 +170,136 @@ public class VerifiedCallTests
     }
 
     [Test]
+    public async Task Call_and_estimate_normalize_base_fee_without_changing_the_authenticated_header(
+        [Values("eth_call", "eth_estimateGas")] string method,
+        [Values("omitted", "legacy-zero", "legacy", "dynamic-zero", "dynamic")] string fees)
+    {
+        byte expected = fees is "legacy" or "dynamic" ? (byte)7 : (byte)0;
+        // Reject an unexpected BASEFEE so estimation also verifies the execution context.
+        FakeSource source = new([0x48, 0x60, expected, 0x14, 0x60, 0x0c, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd,
+            0x5b, 0x48, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3], contractBalance: 1_000_000_000)
+        { BaseFee = 7 };
+        using VerifiedCall call = new(source, MainnetSpecProvider.Instance, NullLogManager.Instance);
+        using VerifiedRpc rpc = new(source, () => source.Head, 1, call);
+        Dictionary<string, string> transaction = new() { ["from"] = Contract.ToString(), ["to"] = Contract.ToString() };
+        if (fees.StartsWith("legacy", StringComparison.Ordinal)) transaction["gasPrice"] = fees == "legacy" ? "0x7" : "0x0";
+        if (fees.StartsWith("dynamic", StringComparison.Ordinal))
+        {
+            transaction["type"] = "0x2";
+            transaction["maxFeePerGas"] = fees == "dynamic" ? "0x8" : "0x0";
+            transaction["maxPriorityFeePerGas"] = fees == "dynamic" ? "0x1" : "0x0";
+        }
+        JsonElement parameters = JsonSerializer.SerializeToElement(new object[] { transaction, "finalized" });
+
+        object first = await rpc.InvokeAsync(method, parameters, CancellationToken.None);
+        object second = await rpc.InvokeAsync(method, parameters, CancellationToken.None);
+
+        using (Assert.EnterMultipleScope())
+        {
+            if (method == "eth_call") Assert.That(first, Is.EqualTo("0x" + new string('0', 63) + expected.ToString("x")));
+            else Assert.That(Convert.ToUInt64(((string)first)[2..], 16), Is.InRange(21_000, 30_000));
+            Assert.That(second, Is.EqualTo(first));
+            Assert.That(source.LastHeader?.BaseFeePerGas, Is.EqualTo((UInt256)7));
+        }
+    }
+
+    [Test]
+    public async Task Execution_reuses_code_by_hash_across_authenticated_state_roots(
+        [Values("eth_call", "eth_estimateGas")] string method)
+    {
+        FakeSource source = new([0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        using VerifiedCall call = new(source, MainnetSpecProvider.Instance, NullLogManager.Instance);
+        using VerifiedRpc rpc = new(source, () => source.Head, 1, call);
+        JsonElement parameters = JsonSerializer.SerializeToElement(new object[] { new { to = Contract.ToString() }, "finalized" });
+
+        object first = await rpc.InvokeAsync(method, parameters, CancellationToken.None);
+        source.Head = new(source.Head.Slot + 1, source.Head.Number + 1, Keccak.Compute("new block"), Keccak.Compute("new state"));
+        object second = await rpc.InvokeAsync(method, parameters, CancellationToken.None);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(second, Is.EqualTo(first));
+            Assert.That(source.CodeFetches, Is.EqualTo(1));
+            Assert.That(source.StorageFetches, Is.EqualTo(2));
+            Assert.That(source.LastQueriedHead, Is.EqualTo(source.Head));
+        }
+    }
+
+    [Test]
+    public async Task Concurrent_hydration_keeps_heads_and_cancellation_isolated([Values] bool cancelFirst)
+    {
+        FakeSource source = new([0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        VerifiedHead firstHead = source.Head;
+        VerifiedHead secondHead = new(firstHead.Slot + 1, firstHead.Number + 1, Keccak.Compute("parallel block"), Keccak.Compute("parallel state"));
+        TaskCompletionSource firstEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource secondEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        source.StorageResponse = async (head, token) =>
+        {
+            if (head == firstHead) firstEntered.TrySetResult();
+            else if (head == secondHead) secondEntered.TrySetResult();
+            else throw new AssertionException("Unexpected authenticated head.");
+            await release.Task.WaitAsync(token);
+            return (UInt256)(head == firstHead ? 42 : 84);
+        };
+        using VerifiedCall calls = new(source, MainnetSpecProvider.Instance, NullLogManager.Instance);
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
+        using CancellationTokenSource interrupted = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        JsonElement transaction = JsonSerializer.SerializeToElement(new { to = Contract.ToString() });
+
+        Task<string> first = calls.ExecuteAsync(firstHead, transaction, false, interrupted.Token);
+        Task<string> second = calls.ExecuteAsync(secondHead, transaction, false, timeout.Token);
+        try
+        {
+            await Task.WhenAll(firstEntered.Task, secondEntered.Task).WaitAsync(timeout.Token);
+            if (cancelFirst)
+            {
+                interrupted.Cancel();
+                await Assert.CatchAsync<OperationCanceledException>(async () => await first);
+                Assert.That(second.IsCompleted, Is.False);
+            }
+        }
+        finally { release.TrySetResult(); }
+
+        string firstResult = cancelFirst
+            ? await calls.ExecuteAsync(firstHead, transaction, false, timeout.Token)
+            : await first;
+        string secondResult = await second;
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(firstResult, Is.EqualTo("0x" + new string('0', 62) + "2a"));
+            Assert.That(secondResult, Is.EqualTo("0x" + new string('0', 62) + "54"));
+        }
+    }
+
+    [Test]
+    public async Task Nested_call_and_estimate_keep_request_state_isolated([Values("eth_call", "eth_estimateGas")] string method)
+    {
+        // The outer call invokes itself with one calldata byte; the inner call increments authenticated storage.
+        FakeSource source = new([0x36, 0x15, 0x60, 0x17, 0x57,
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x80, 0x60, 0x00, 0x55,
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, 0x5b,
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x01, 0x60, 0x00, 0x60, 0x00, 0x30, 0x5a, 0xf1,
+            0x60, 0x2d, 0x57, 0x60, 0x00, 0x60, 0x00, 0xfd, 0x5b,
+            0x60, 0x20, 0x60, 0x00, 0xf3]);
+        using VerifiedCall call = new(source, MainnetSpecProvider.Instance, NullLogManager.Instance);
+        using VerifiedRpc rpc = new(source, () => source.Head, 1, call);
+        JsonElement parameters = JsonSerializer.SerializeToElement(new object[] { new { to = Contract.ToString() }, "finalized" });
+
+        object first = await rpc.InvokeAsync(method, parameters, CancellationToken.None);
+        object second = await rpc.InvokeAsync(method, parameters, CancellationToken.None);
+
+        using (Assert.EnterMultipleScope())
+        {
+            if (method == "eth_call") Assert.That(first, Is.EqualTo("0x" + new string('0', 62) + "2b"));
+            else Assert.That(Convert.ToUInt64(((string)first)[2..], 16), Is.InRange(21_000, 100_000));
+            Assert.That(second, Is.EqualTo(first));
+            Assert.That(source.CodeFetches, Is.EqualTo(1));
+            Assert.That(source.StorageFetches, Is.EqualTo(1));
+        }
+    }
+
+    [Test]
     public async Task Call_fetches_storage_touched_by_evm()
     {
         // SLOAD(0), MSTORE(0), RETURN(0, 32).
@@ -341,19 +471,21 @@ public class VerifiedCallTests
     private sealed class FakeSource(byte[] code, UInt256 contractBalance = default) : IExecutionStateSource
     {
         private readonly Account _contract = new(1, contractBalance, Keccak.Compute("storage root"), Keccak.Compute(code));
-        public VerifiedHead Head { get; } = new(100, 26_000_000, Keccak.Compute("block"), Keccak.Compute("state"));
+        public VerifiedHead Head { get; set; } = new(100, 26_000_000, Keccak.Compute("block"), Keccak.Compute("state"));
         public int Fetches { get; private set; }
         public int CodeFetches { get; private set; }
         public int StorageFetches { get; private set; }
         public int AncestorFetches { get; private set; }
         public bool WrongHeaderRoot { get; init; }
         public UInt256 BaseFee { get; init; } = 1;
+        public BlockHeader? LastHeader { get; private set; }
         public ulong BlockGasLimit { get; set; } = 30_000_000;
         public VerifiedHead? LastCanonicalAnchor { get; private set; }
         public VerifiedHead? LastQueriedHead { get; private set; }
         public Address? LastStorageAddress { get; private set; }
         public UInt256 LastStorageKey { get; private set; }
         public VerifiedHead? CanonicalHistoricalHead { get; set; }
+        public Func<VerifiedHead, CancellationToken, Task<UInt256>>? StorageResponse { get; set; }
         public int Broadcasts { get; private set; }
         public Task BroadcastTransactionAsync(Transaction transaction, CancellationToken cancellationToken)
         {
@@ -375,6 +507,7 @@ public class VerifiedCallTests
                 ExcessBlobGas = 0,
                 IsPostMerge = true
             };
+            LastHeader = header;
             return Task.FromResult(header);
         }
 
@@ -395,7 +528,7 @@ public class VerifiedCallTests
             StorageFetches++;
             LastStorageAddress = address;
             LastStorageKey = key;
-            return Task.FromResult((UInt256)42);
+            return StorageResponse?.Invoke(head, cancellationToken) ?? Task.FromResult((UInt256)42);
         }
 
         public Task<byte[]> GetCodeAsync(Account account, CancellationToken cancellationToken)

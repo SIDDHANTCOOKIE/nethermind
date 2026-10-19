@@ -261,7 +261,7 @@ internal sealed class ExecutionPeerTransport : IExecutionStateSource, IAsyncDisp
         AccountsAndProofs response, ILogManager logs)
     {
         ValueHash256 path = ValueKeccak.Compute(address.Bytes);
-        Account verified = VerifyAccountRange(head.StateRoot, address, response, logs);
+        ValidateAccountRange(response);
         using MemDb db = new();
         NodeStorage nodes = new(db, INodeStorage.KeyScheme.Hash);
         if (response.PathAndAccounts.Count != 0)
@@ -273,7 +273,8 @@ internal sealed class ExecutionPeerTransport : IExecutionStateSource, IAsyncDisp
         }
         byte[][] witness = CollectProof(db, nodes, head.StateRoot, path, response.Proofs);
         Account exported = ExecutionProofVerifier.VerifyAccount(head.StateRoot, address, witness);
-        if (exported != verified) throw new InvalidDataException("Reconstructed account witness differs from the verified range.");
+        if (response.PathAndAccounts.Count != 0 && exported != FindAccount(path, response.PathAndAccounts))
+            throw new InvalidDataException("Reconstructed account witness differs from the verified range.");
         return (exported, witness);
     }
 
@@ -281,10 +282,11 @@ internal sealed class ExecutionPeerTransport : IExecutionStateSource, IAsyncDisp
         SlotsAndProofs response, ILogManager logs)
     {
         ValueHash256 slotPath = ValueKeccak.Compute(key.ToBigEndian());
-        UInt256 value = VerifyStorageRange(account, accountPath, key, response, logs);
+        ValidateStorageRange(response);
         using MemDb db = new();
         NodeStorage nodes = new(db, INodeStorage.KeyScheme.Hash);
-        if (response.PathsAndSlots.Count != 0 && response.PathsAndSlots[0].Count != 0)
+        bool hasSlots = response.PathsAndSlots.Count != 0 && response.PathsAndSlots[0].Count != 0;
+        if (hasSlots)
         {
             PatriciaSnapTrieFactory factory = new(nodes, NullDb.Instance, logs);
             if (SnapProviderHelper.AddStorageRange(factory, new(accountPath, account), response.PathsAndSlots[0],
@@ -292,7 +294,8 @@ internal sealed class ExecutionPeerTransport : IExecutionStateSource, IAsyncDisp
                 throw new InvalidDataException("Could not reconstruct the verified storage path.");
         }
         byte[][] witness = CollectProof(db, nodes, account.StorageRoot, slotPath, response.Proofs);
-        if (ExecutionProofVerifier.VerifyStorage(account.StorageRoot, key, witness) != value)
+        UInt256 value = ExecutionProofVerifier.VerifyStorage(account.StorageRoot, key, witness);
+        if (hasSlots && value != FindStorage(slotPath, response.PathsAndSlots[0]))
             throw new InvalidDataException("Reconstructed storage witness differs from the verified range.");
         return new ExecutionStorageProof(key, value, witness);
     }
@@ -597,36 +600,56 @@ internal sealed class ExecutionPeerTransport : IExecutionStateSource, IAsyncDisp
     internal static Account VerifyAccountRange(Hash256 stateRoot, Address address, AccountsAndProofs response, ILogManager logManager)
     {
         ValueHash256 path = ValueKeccak.Compute(address.Bytes);
-        ValidateProof(response.Proofs);
+        ValidateAccountRange(response);
         if (response.PathAndAccounts.Count == 0)
             return ExecutionProofVerifier.VerifyAccount(stateRoot, address, CopyProof(response.Proofs));
-        if (response.PathAndAccounts.Count > 4)
-            throw new InvalidDataException("Execution peer returned too many accounts for a single-key range.");
 
         using MemDb db = new();
         PatriciaSnapTrieFactory factory = new(new NodeStorage(db), NullDb.Instance, logManager);
         if (SnapProviderHelper.VerifyAccountRange(factory, stateRoot, path, path.IncrementPath(), response.PathAndAccounts, response.Proofs) != AddRangeResult.OK)
             throw new InvalidDataException("Execution peer returned an invalid account range proof.");
-        foreach (PathWithAccount entry in response.PathAndAccounts)
-            if (entry.Path == path) return entry.Account ?? throw new InvalidDataException("Account range omitted its account value.");
-        return Account.TotallyEmpty;
+        return FindAccount(path, response.PathAndAccounts);
     }
 
     internal static UInt256 VerifyStorageRange(Account account, ValueHash256 accountPath, UInt256 key, SlotsAndProofs response, ILogManager logManager)
     {
         ValueHash256 slotPath = ValueKeccak.Compute(key.ToBigEndian());
-        ValidateProof(response.Proofs);
+        ValidateStorageRange(response);
         if (response.PathsAndSlots.Count == 0 || response.PathsAndSlots.Count == 1 && response.PathsAndSlots[0].Count == 0)
             return ExecutionProofVerifier.VerifyStorage(account.StorageRoot, key, CopyProof(response.Proofs));
-        if (response.PathsAndSlots.Count != 1 || response.PathsAndSlots[0].Count > 4)
-            throw new InvalidDataException("Execution peer returned an invalid storage range size.");
 
         using MemDb db = new();
         PatriciaSnapTrieFactory factory = new(new NodeStorage(db), NullDb.Instance, logManager);
         if (SnapProviderHelper.AddStorageRange(factory, new PathWithAccount(accountPath, account), response.PathsAndSlots[0],
                 slotPath, slotPath.IncrementPath(), response.Proofs).result != AddRangeResult.OK)
             throw new InvalidDataException("Execution peer returned an invalid storage range proof.");
-        foreach (PathWithStorageSlot entry in response.PathsAndSlots[0])
+        return FindStorage(slotPath, response.PathsAndSlots[0]);
+    }
+
+    private static void ValidateAccountRange(AccountsAndProofs response)
+    {
+        ValidateProof(response.Proofs);
+        if (response.PathAndAccounts.Count > 4)
+            throw new InvalidDataException("Execution peer returned too many accounts for a single-key range.");
+    }
+
+    private static void ValidateStorageRange(SlotsAndProofs response)
+    {
+        ValidateProof(response.Proofs);
+        if (response.PathsAndSlots.Count > 1 || response.PathsAndSlots.Count == 1 && response.PathsAndSlots[0].Count > 4)
+            throw new InvalidDataException("Execution peer returned an invalid storage range size.");
+    }
+
+    private static Account FindAccount(ValueHash256 path, IReadOnlyList<PathWithAccount> accounts)
+    {
+        foreach (PathWithAccount entry in accounts)
+            if (entry.Path == path) return entry.Account ?? throw new InvalidDataException("Account range omitted its account value.");
+        return Account.TotallyEmpty;
+    }
+
+    private static UInt256 FindStorage(ValueHash256 slotPath, IReadOnlyList<PathWithStorageSlot> slots)
+    {
+        foreach (PathWithStorageSlot entry in slots)
             if (entry.Path == slotPath) return ExecutionProofVerifier.DecodeStorageRlp(entry.SlotRlpValue);
         return UInt256.Zero;
     }
