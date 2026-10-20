@@ -48,7 +48,12 @@ public class PrewarmerTxAdapter(
             }
 
             // No warm run covered it in time: what it costs here moves such runs forward in later blocks.
-            if (eligible && footprint is null && preWarmer.CostTable is { } costs) return ExecuteLearningCost(transaction, txTracer, costs);
+            if (eligible && footprint is null && preWarmer.CostTable is { } costs)
+            {
+                // Through the replay's result: a result of its own is one more slot every replay's frame zeroes.
+                ExecuteLearningCost(transaction, txTracer, costs, out result);
+                return result;
+            }
 
             // What the transaction writes goes to the block's footprints, so those that read it are refreshed on those values.
             if (prewarmerState.CommittedWrites is { } committed && preWarmer.TakesExecutedWrites) return ExecuteReportingWrites(transaction, txTracer, committed);
@@ -80,14 +85,13 @@ public class PrewarmerTxAdapter(
         }
     }
 
-    private TransactionResult ExecuteLearningCost(Transaction transaction, ITxTracer txTracer, TransactionCostTable costs)
+    private void ExecuteLearningCost(Transaction transaction, ITxTracer txTracer, TransactionCostTable costs, out TransactionResult result)
     {
         long start = Stopwatch.GetTimestamp();
-        TransactionResult result = prewarmerState.CommittedWrites is { } committed && preWarmer.TakesExecutedWrites
+        result = prewarmerState.CommittedWrites is { } committed && preWarmer.TakesExecutedWrites
             ? ExecuteReportingWrites(transaction, txTracer, committed)
             : baseAdapter.Execute(transaction, txTracer);
         if (result) costs.Learn(transaction, Stopwatch.GetElapsedTime(start));
-        return result;
     }
 
     public void SetBlockExecutionContext(in BlockExecutionContext blockExecutionContext)
