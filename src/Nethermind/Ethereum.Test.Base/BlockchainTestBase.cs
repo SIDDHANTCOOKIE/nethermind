@@ -151,6 +151,7 @@ public abstract class BlockchainTestBase
         // Bench harness, not for merge: the blocks are processed with block prewarming on.
         blocksConfig.PreWarmStateConcurrency = 4;
         blocksConfig.PreWarming = PreWarmMode.Block;
+        blocksConfig.PreWarmCostOrdering = true;
         if (ParallelExecutionOverride.HasValue)
         {
             blocksConfig.ParallelExecution = ParallelExecutionOverride.Value;
