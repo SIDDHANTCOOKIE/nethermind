@@ -148,6 +148,61 @@ Example request:
 Invoke-RestMethod http://127.0.0.1:8545 -Method Post -ContentType application/json -Body '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"]}'
 ```
 
+## Host selected accounts
+
+Add `--host-accounts` to the run command to retain complete state for specific
+accounts alongside the normal bounded proof cache:
+
+```powershell
+dotnet run --project src/Nethermind/Nethermind.LightClient -c release -p:SaveDiskSpace=true -- --network mainnet --checkpoint-url https://mainnet.checkpoint.sigp.io --host-accounts 0xde198901C5ee4611142E0c61DfbbCEc7ab468F32,0x50614cc8e44f7814549c223aa31db9296e58057c
+```
+
+The comma-separated list selects accounts explicitly; duplicate addresses are
+ignored. Each snapshot includes balance, nonce, bytecode and **all nonzero storage
+slots**, rather than only slots previously requested by RPC. SNAP range proofs
+authenticate every page, and the complete retained storage must reconstruct the
+proven storage root before publication. Missing slots then have a verified zero
+value. Full storage includes mapping entries without needing their original keys.
+
+Snapshots stay in RAM without cache eviction. Only the latest completed snapshot
+of each configured account is retained; old versions are replaced. This is not
+disk persistence: restart downloads the selected state again. Large contracts
+can require substantial RAM, temporary verification memory, bandwidth and time;
+there is deliberately no size eviction for accounts you select. No accounts are
+hosted by default.
+
+A background worker follows authenticated optimistic `latest`, checking for new
+roots every five seconds after the preceding refresh. At a new root it fetches
+a fresh account proof. Unchanged storage roots and code hashes reuse their
+verified data; changed storage uses a full download unless BAL updates are enabled.
+A snapshot becomes visible atomically only when all its data has verified.
+Reorganizations use the same root checks. While catching up, RPC uses the regular proof-backed P2P path
+for anything the retained snapshot cannot authenticate at the requested root.
+Other accounts and historical roots continue to use that path. `eth_getProof`
+continues to request witnesses from peers. Shutdown cancels and joins the worker.
+
+To update hosted storage incrementally using [EIP-7928 BALs](https://eips.ethereum.org/EIPS/eip-7928),
+add `--host-accounts-bal true` to the same command. This is **disabled by default**
+and only applies to accounts selected by `--host-accounts`. The first snapshot
+still requires a complete SNAP download. Balance, nonce and code commitments
+continue to come from fresh account proofs; changed bytecode is fetched and
+hash-checked normally, including hash-only code adoption.
+
+The updater verifies every intervening execution header and its ancestry back to
+the retained snapshot before fetching any BALs. It obtains BALs over SNAP/2 or
+ETH/71+, checks their raw RLP hashes against the authenticated headers, applies
+each slot's final value in block order and removes zeroed slots. The resulting
+complete local storage must reconstruct the freshly proven account storage root
+before publication. It still rebuilds that local trie; BALs reduce network
+transfers rather than eliminating work proportional to hosted storage size.
+
+Catch-up is limited to 256 forward blocks, 30 seconds per account attempt and
+16 MiB per encoded BAL. Only the latest fetched BAL is retained for reuse across
+accounts. Unsupported forks or peers, reorgs, larger gaps, timeouts, missing or
+invalid data and root mismatches fall back to the complete SNAP download. If
+that also fails, the previous verified snapshot stays available at its original
+root. Merely relabeling old state with a new root is never safe.
+
 ## Verified RPC contract
 
 | Method | Result source |

@@ -25,6 +25,8 @@ if (Array.Exists(args, static arg => arg is "--help" or "-h"))
         "          --checkpoint-check-url <independent trusted HTTPS Beacon API>\n" +
         "Optional: --network mainnet|hoodi|sepolia (default mainnet) --urls http://127.0.0.1:8545\n" +
         "          --data-dir src/Nethermind/artifacts/lightclient\n" +
+        "          --host-accounts <0xaddress,0xaddress,...> (complete account state retained in RAM)\n" +
+        "          --host-accounts-bal true|false (incremental BAL storage updates; default false)\n" +
         "Mainnet needs --checkpoint or --checkpoint-url; Hoodi and Sepolia use EF-operated defaults.\n" +
         "See README.md for verified RPC selectors and checkpoint trust requirements.");
     return;
@@ -68,6 +70,8 @@ async Task RunClientAsync(CancellationToken stoppingToken)
     builder.Services.Replace(ServiceDescriptor.Singleton<ILoggerFactory>(new NethermindLoggerFactory(logManager)));
     builder.Services.AddCors();
     string network = builder.Configuration["network"] ?? "mainnet";
+    Address[] hostedAccounts = HostedAccountState.ParseAccounts(builder.Configuration["host-accounts"]);
+    bool hostedAccountsBal = builder.Configuration.GetValue<bool>("host-accounts-bal");
     BeaconChainSpec spec = network switch
     {
         "mainnet" => BeaconChainSpec.Mainnet,
@@ -153,7 +157,8 @@ async Task RunClientAsync(CancellationToken stoppingToken)
     ulong finalizedExecutionTimestamp = 0;
     ulong ExecutionTime(VerifiedHead verified) => spec.GenesisTime + verified.Slot * spec.SecondsPerSlot;
     await using ExecutionPeerTransport execution = new(network, logManager,
-        provisionalHead, ExecutionTime(provisionalHead), dataDirectory: dataDirectory);
+        provisionalHead, ExecutionTime(provisionalHead), dataDirectory: dataDirectory, hostedAccounts: hostedAccounts,
+        hostedAccountsBal: hostedAccountsBal);
     await execution.StartAsync(app.Lifetime.ApplicationStopping);
     logger.LogInformation("Execution P2P started; searching for SNAP peers via {Domain}", execution.DiscoveryDomain);
     async Task<(VerifiedHead Head, ulong Timestamp)> ResolveAsync(LightClientHeader header, CancellationToken token)
@@ -276,7 +281,8 @@ async Task RunClientAsync(CancellationToken stoppingToken)
     {
         using CancellationTokenSource workersStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         Task[] workers = [PollConsensusAsync(workersStop.Token), PublishConsensusAsync(workersStop.Token),
-            ReportPeersAsync(workersStop.Token), beacon.GossipCompletion];
+            ReportPeersAsync(workersStop.Token), beacon.GossipCompletion,
+            execution.HostAccountsAsync(GetLatestHead, clock, workersStop.Token)];
         await Task.WhenAny(workers);
         app.Lifetime.StopApplication();
         await workersStop.CancelAsync();

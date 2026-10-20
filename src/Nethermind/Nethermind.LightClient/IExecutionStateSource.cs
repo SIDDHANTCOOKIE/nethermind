@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 
 using Nethermind.Core;
+using Nethermind.Core.BlockAccessLists;
 using Nethermind.Core.Crypto;
 using Nethermind.Int256;
 
@@ -14,6 +15,7 @@ internal interface IExecutionStateSource
     Task<byte[]> GetCodeAsync(Account account, CancellationToken cancellationToken);
     Task<BlockHeader> GetHeaderByHashAsync(Hash256 hash, CancellationToken cancellationToken) => throw new NotSupportedException();
     Task<BlockHeader> GetHeaderAsync(VerifiedHead head, CancellationToken cancellationToken);
+    Task<ReadOnlyBlockAccessList> GetBlockAccessListAsync(BlockHeader header, CancellationToken cancellationToken) => throw new NotSupportedException();
     Task<Hash256[]> GetAncestorHashesAsync(VerifiedHead head, ulong firstNumber, CancellationToken cancellationToken);
     Task<BlockHeader> GetCanonicalHeaderAsync(VerifiedHead head, ulong number, CancellationToken cancellationToken) => throw new NotSupportedException();
     Task<Block> GetBlockAsync(BlockHeader header, CancellationToken cancellationToken) => throw new NotSupportedException();
