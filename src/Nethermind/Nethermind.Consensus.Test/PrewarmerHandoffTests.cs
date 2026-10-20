@@ -351,6 +351,56 @@ public class PrewarmerHandoffMechanicsTests(bool earlyStart) : PrewarmerHandoffT
     }
 
     [Test]
+    public void Only_the_transactions_no_warm_run_covered_teach_the_cost_table_what_they_cost()
+    {
+        TransactionCostTable costs = new();
+        PreBlockCaches caches = ProcessingScope.Resolve<PreBlockCaches>();
+        using BlockCachePreWarmer preWarmer = new(
+            new BlockCachePreWarmer.ReadOnlyTxProcessingEnvPooledObjectPolicy(ProcessingScope.Resolve<PrewarmerEnvFactory>(), caches),
+            minPoolSize: 4,
+            concurrency: 3,
+            parallelExecutionBatchRead: true,
+            ProcessingScope.Resolve<NodeStorageCache>(),
+            caches,
+            LimboLogs.Instance,
+            handoff: true,
+            earlyStart: EarlyStart,
+            costs: costs);
+        PrewarmerTxAdapter adapter = new(
+            new ExecuteTransactionProcessorAdapter(ProcessingScope.Resolve<ITransactionProcessor>()),
+            preWarmer,
+            new PrewarmerState(caches, isPrewarmer: false),
+            ProcessingScope.Resolve<IWorldState>(),
+            LimboLogs.Instance);
+
+        Run covered = Handoff(BuildBlock(
+            Transfer(TestItem.PrivateKeyA, 0, TestItem.AddressC, 1.Wei),
+            Transfer(TestItem.PrivateKeyB, 0, TestItem.AddressC, 2.Wei),
+            Transfer(TestItem.PrivateKeyD, 0, TestItem.AddressC, 3.Wei),
+            Call(TestItem.PrivateKeyA, 1, BalanceReader)), preWarmer, adapter);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(covered.Tally, Is.EqualTo((3, 1, 0)), "precondition: replayed and rejected");
+            Assert.That(costs.Count, Is.Zero, "neither a replay nor a transaction whose run no longer held is learned");
+        }
+
+        // The footprints the block finds are another block's, so no transaction has one.
+        RunPreWarmCaches(preWarmer, ThreeIndependentTransactions());
+        Block block = BuildBlock(
+            Call(TestItem.PrivateKeyA, 0, Counter, data: [0xa9, 0x05, 0x9c, 0xbb]),
+            Transfer(TestItem.PrivateKeyB, 0, TestItem.AddressD, 1.Wei),
+            Create(TestItem.PrivateKeyD, 0, DeployCode));
+        Run missing = Process(block, adapter);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(missing.Tally, Is.EqualTo((0, 0, 3)), "precondition: no footprint");
+            Assert.That(costs.Count, Is.EqualTo(2), "a contract creation is not learned");
+            Assert.That(costs.TryGetCost(block.Transactions[0], out double callCost) && callCost > 0, $"the call, at {callCost} ms");
+            Assert.That(costs.TryGetCost(block.Transactions[1], out double transferCost) && transferCost > 0, $"the transfer, at {transferCost} ms");
+        }
+    }
+
+    [Test]
     public void Decorating_block_processing_components_leaves_the_handoff_on([Values] bool worldState)
     {
         Action<ContainerBuilder> decorate = worldState

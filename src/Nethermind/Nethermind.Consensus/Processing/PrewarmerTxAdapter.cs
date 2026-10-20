@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 
 using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Nethermind.Blockchain.Tracing;
 using Nethermind.Core;
@@ -46,6 +47,9 @@ public class PrewarmerTxAdapter(
                 return result;
             }
 
+            // No warm run covered it in time: what it costs here moves such runs forward in later blocks.
+            if (eligible && footprint is null && preWarmer.CostTable is { } costs) return ExecuteLearningCost(transaction, txTracer, costs);
+
             // What the transaction writes goes to the block's footprints, so those that read it are refreshed on those values.
             if (prewarmerState.CommittedWrites is { } committed && preWarmer.TakesExecutedWrites) return ExecuteReportingWrites(transaction, txTracer, committed);
         }
@@ -74,6 +78,16 @@ public class PrewarmerTxAdapter(
             // Reported also when there are none: the writes its footprint predicted were not made.
             preWarmer.ReportExecutedWrites(committed.End());
         }
+    }
+
+    private TransactionResult ExecuteLearningCost(Transaction transaction, ITxTracer txTracer, TransactionCostTable costs)
+    {
+        long start = Stopwatch.GetTimestamp();
+        TransactionResult result = prewarmerState.CommittedWrites is { } committed && preWarmer.TakesExecutedWrites
+            ? ExecuteReportingWrites(transaction, txTracer, committed)
+            : baseAdapter.Execute(transaction, txTracer);
+        if (result) costs.Learn(transaction, Stopwatch.GetElapsedTime(start));
+        return result;
     }
 
     public void SetBlockExecutionContext(in BlockExecutionContext blockExecutionContext)

@@ -109,6 +109,22 @@ public static class Metrics
     [Description("Transactions block processing took over from a pre-warm run of the mempool pass")]
     public static long PrewarmMempoolRunsTakenOver { get; set; }
 
+    [CounterMetric]
+    [Description("Pre-warm jobs placed by what block processing learned their transactions cost")]
+    public static long PrewarmCostLearnedJobs;
+
+    [CounterMetric]
+    [Description("Pre-warm jobs placed by gas and block order, with no learned cost")]
+    public static long PrewarmCostFallbackJobs;
+
+    [CounterMetric]
+    [Description("Pre-warm jobs moved ahead of block order for their learned cost")]
+    public static long PrewarmCostPromotedJobs;
+
+    [GaugeMetric]
+    [Description("Recipient and selector pairs whose execution cost the pre-warm job order has learned")]
+    public static long PrewarmCostTableEntries { get; set; }
+
     [GaugeMetric]
     [Description("Gas Used in processed blocks")]
     public static ulong GasUsed { get; set; }

@@ -80,6 +80,8 @@ namespace Nethermind.Config
 
         public bool PreWarmTransactionWorkersFirst { get; set; } = true;
 
+        public bool PreWarmCostOrdering { get; set; }
+
         public ProcessingCores ProcessingCores { get; set; } = ProcessingCores.Performance;
 
         public bool PreWarmCoreSplit { get; set; } = true;

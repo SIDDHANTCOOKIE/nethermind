@@ -85,6 +85,9 @@ public interface IBlocksConfig : IConfig
     [ConfigItem(Description = "With PreWarmEarlyStart, queue a block's transaction pre-warm workers ahead of the pre-warming of its senders and recipients.", DefaultValue = "true", HiddenFromDocs = true)]
     bool PreWarmTransactionWorkersFirst { get; set; }
 
+    [ConfigItem(Description = "Warm a block's transactions in the order of what executing them cost block processing when no pre-warm run covered them, learned per recipient and selector, behind a front lane kept in block order. Requires PreWarming.", DefaultValue = "false", HiddenFromDocs = true)]
+    bool PreWarmCostOrdering { get; set; }
+
     [ConfigItem(Description = "The block production timeout, in milliseconds.", DefaultValue = "4000")]
     int BlockProductionTimeoutMs { get; set; }
 

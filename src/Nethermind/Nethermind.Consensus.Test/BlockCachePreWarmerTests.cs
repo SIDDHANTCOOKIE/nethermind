@@ -1789,6 +1789,75 @@ public class BlockCachePreWarmerTests(bool earlyStart)
     }
 
     [Test]
+    public void GroupTransactionsBySender_WithAnEmptyCostTable_OrdersAsTheGasHoist()
+    {
+        Block block = CostOrderBlock();
+        int[] gasHoist = [11, 18, 1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16];
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(JobOrder(block, costs: null), Is.EqualTo(gasHoist), "precondition: the gas hoist's order");
+            Assert.That(JobOrder(block, new TransactionCostTable()), Is.EqualTo(gasHoist));
+        }
+    }
+
+    [Test]
+    public void GroupTransactionsBySender_WithLearnedCosts_KeepsTheFrontLaneInBlockOrder()
+    {
+        int[] order = JobOrder(CostOrderBlock(), LearnedCosts(CostOrderBlock()));
+
+        // The 9 ms learned at position 3 is not asked for, a job the gas hoist lifts in the lane stays lifted, and no
+        // job past the lane is moved ahead of it for its learned cost.
+        Assert.That(order[..11], Is.EqualTo(new[] { 18, 1, 0, 2, 3, 4, 5, 6, 7, 8, 9 }));
+    }
+
+    [Test]
+    public void GroupTransactionsBySender_WithLearnedCosts_OrdersByCostBehindTheFrontLane()
+    {
+        int[] order = JobOrder(CostOrderBlock(), LearnedCosts(CostOrderBlock()));
+
+        // Costliest first, equal costs in block order, a sender group by the sum of its transactions (16 and 17), then
+        // block order for what is learned below the promotion cost (10, and 11 despite its gas) or not learned (13).
+        Assert.That(order[11..], Is.EqualTo(new[] { 14, 12, 15, 16, 10, 11, 13 }));
+    }
+
+    [Test]
+    public void PreWarmCostOrdering_GivesThePreWarmerTheSharedCostTableOnlyWhenOn([Values] bool on)
+    {
+        using BlockCachePreWarmer preWarmer = new(_processingScope.Resolve<PrewarmerEnvFactory>(),
+            new BlocksConfig { PreWarmCostOrdering = on, PreWarmEarlyStart = _earlyStart },
+            _processingScope.Resolve<NodeStorageCache>(),
+            _processingScope.Resolve<PreBlockCaches>(),
+            LimboLogs.Instance);
+
+        Assert.That(preWarmer.CostTable, on ? Is.SameAs(TransactionCostTable.Shared) : Is.Null);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public async Task PreWarmCaches_OrdersTheBlocksJobsByTheCostTable()
+    {
+        Block block = CostOrderBlock();
+        TransactionCostTable costs = LearnedCosts(block);
+        PreBlockCaches preBlockCaches = _processingScope.Resolve<PreBlockCaches>();
+        using BlockCachePreWarmer preWarmer = new(
+            new BlockCachePreWarmer.ReadOnlyTxProcessingEnvPooledObjectPolicy(_processingScope.Resolve<PrewarmerEnvFactory>(), preBlockCaches),
+            minPoolSize: 4, concurrency: 2, parallelExecutionBatchRead: true, _processingScope.Resolve<NodeStorageCache>(), preBlockCaches,
+            LimboLogs.Instance, earlyStart: _earlyStart, costs: costs);
+        (long learned, long fallback, long promoted) = (Blockchain.Metrics.PrewarmCostLearnedJobs, Blockchain.Metrics.PrewarmCostFallbackJobs, Blockchain.Metrics.PrewarmCostPromotedJobs);
+
+        await RunPreWarmCaches(preWarmer, block, BuildParentHeader(), Osaka.Instance);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(Blockchain.Metrics.PrewarmCostLearnedJobs - learned, Is.EqualTo(6), "the jobs past the front lane with a learned cost");
+            Assert.That(Blockchain.Metrics.PrewarmCostPromotedJobs - promoted, Is.EqualTo(4));
+            Assert.That(Blockchain.Metrics.PrewarmCostFallbackJobs - fallback, Is.EqualTo(12));
+            Assert.That(Blockchain.Metrics.PrewarmCostTableEntries, Is.EqualTo(costs.Count));
+        }
+    }
+
+    [Test]
     public void SelectDiscoveryCandidates_ReturnsNullWhenAllBelowThreshold()
     {
         Transaction belowThreshold = Build.A.Transaction.WithGasLimit(5_000_000).WithTo(TestItem.AddressC)
@@ -2836,6 +2905,51 @@ public class BlockCachePreWarmerTests(bool earlyStart)
 
     private static Transaction GroupingTx(PrivateKey sender, uint nonce, ulong gasLimit) =>
         Build.A.Transaction.WithNonce(nonce).WithGasLimit(gasLimit).WithTo(TestItem.AddressD).SignedAndResolved(sender).TestObject;
+
+    /// <summary>
+    /// Nineteen calls, each with a selector of its own: the gas hoist lifts position 1, in the front lane, and positions
+    /// 11 and 18 past it; positions 16 and 17 are one sender's group.
+    /// </summary>
+    private static Block CostOrderBlock()
+    {
+        Transaction[] transactions = new Transaction[19];
+        for (int i = 0; i < transactions.Length; i++)
+        {
+            ulong gasLimit = i switch { 1 => 5_000_000, 11 or 18 => 6_000_000, _ => 100_000 };
+            transactions[i] = Build.A.Transaction.WithNonce(i == 17 ? 1u : 0u).WithGasLimit(gasLimit).WithTo(TestItem.AddressD)
+                .WithData([0, 0, 0, (byte)i]).SignedAndResolved(TestItem.PrivateKeys[i == 17 ? 17 : i + 1]).TestObject;
+        }
+
+        return Build.A.Block.WithNumber(1).WithTransactions(transactions).WithGasLimit(60_000_000).TestObject;
+    }
+
+    /// <summary>Costs for <see cref="CostOrderBlock"/>: one in the front lane, the rest past it.</summary>
+    private static TransactionCostTable LearnedCosts(Block block)
+    {
+        TransactionCostTable costs = new();
+        foreach ((int index, double ms) in new[] { (3, 9.0), (10, 0.1), (11, 0.2), (12, 0.8), (14, 2.0), (15, 0.8), (16, 0.3), (17, 0.3) })
+        {
+            costs.Learn(block.Transactions[index], TimeSpan.FromMilliseconds(ms));
+        }
+
+        return costs;
+    }
+
+    /// <summary>The first block position of each job, in the order the workers take them.</summary>
+    private static int[] JobOrder(Block block, TransactionCostTable? costs)
+    {
+        ArrayPoolList<BlockCachePreWarmer.WarmupJob> jobs = BlockCachePreWarmer.GroupTransactionsBySender(block, maxWorkers: 4, costs: costs);
+        try
+        {
+            int[] order = new int[jobs.Count];
+            for (int i = 0; i < order.Length; i++) order[i] = jobs[i].FirstIndex;
+            return order;
+        }
+        finally
+        {
+            DisposeGroups(jobs);
+        }
+    }
 
     private static ArrayPoolList<(int Index, Transaction Tx)> FindGroup(
         ArrayPoolList<BlockCachePreWarmer.WarmupJob> groups, Address sender)

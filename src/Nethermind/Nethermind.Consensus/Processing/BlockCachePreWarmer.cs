@@ -63,6 +63,7 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
     private readonly bool _handoff;
     private readonly bool _earlyStart;
     private readonly bool _transactionWorkersFirst;
+    private readonly TransactionCostTable? _costs;
     private BlockFootprints? _footprints;
 
     private const int MaxDiscoveryCandidates = 16;
@@ -126,7 +127,8 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
         senderRecovery,
         handoff: envFactory.RecordsFootprints,
         earlyStart: blocksConfig.PreWarmEarlyStart,
-        transactionWorkersFirst: blocksConfig.PreWarmTransactionWorkersFirst)
+        transactionWorkersFirst: blocksConfig.PreWarmTransactionWorkersFirst,
+        costs: blocksConfig.PreWarmCostOrdering ? TransactionCostTable.Shared : null)
     {
         _parallelExecutionEnabled = blocksConfig.ParallelExecution;
         _blockCodeCache = blockCodeCache;
@@ -146,12 +148,14 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
         ISenderRecoveryTracker? senderRecovery = null,
         bool handoff = false,
         bool earlyStart = true,
-        bool transactionWorkersFirst = true)
+        bool transactionWorkersFirst = true,
+        TransactionCostTable? costs = null)
     {
         _senderRecovery = senderRecovery;
         _handoff = handoff;
         _earlyStart = earlyStart;
         _transactionWorkersFirst = transactionWorkersFirst;
+        _costs = costs;
         _concurrencyLevel = concurrency == 0 ? Environment.ProcessorCount - 1 : concurrency;
         _speculativeConcurrencyLevel = speculativeConcurrency == 0 ? Math.Max(1, _concurrencyLevel / 2) : speculativeConcurrency;
         _parallelExecutionBatchRead = parallelExecutionBatchRead;
@@ -243,6 +247,7 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
                 ? null
                 : SelectDiscoveryCandidates(suggestedBlock, speculativelyWarmed);
             blockState.UpFrontDiscovery = discoveryCandidates;
+            blockState.Costs = _costs;
             if (_earlyStart && _transactionWorkersFirst && !addressWarmer.HasBal)
             {
                 // The sender and recipient fan-out is held until the transaction workers are queued, so they take the
@@ -1265,10 +1270,11 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
     }
 
     /// <summary>For tests: the jobs, and with them their transaction lists, are the caller's to dispose; the scratch is released here.</summary>
-    internal static ArrayPoolList<WarmupJob> GroupTransactionsBySender(Block block, int maxWorkers, ISet<Hash256>? speculativelyWarmed = null, int[]? claimed = null)
+    internal static ArrayPoolList<WarmupJob> GroupTransactionsBySender(Block block, int maxWorkers, ISet<Hash256>? speculativelyWarmed = null, int[]? claimed = null,
+        TransactionCostTable? costs = null)
     {
         using GroupingScratch scratch = new();
-        GroupTransactionsBySender(block, maxWorkers, speculativelyWarmed, claimed, scratch);
+        GroupTransactionsBySender(block, maxWorkers, speculativelyWarmed, claimed, scratch, costs);
         ArrayPoolList<WarmupJob> jobs = new(scratch.Jobs.Count);
         jobs.AddRange(scratch.Jobs.AsSpan());
         scratch.Jobs.Clear();
@@ -1276,7 +1282,9 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
     }
 
     /// <summary>Groups into <paramref name="scratch"/>, whose lists and dictionary are reused block after block.</summary>
-    private static void GroupTransactionsBySender(Block block, int maxWorkers, ISet<Hash256>? speculativelyWarmed, int[]? claimed, GroupingScratch scratch)
+    /// <param name="costs">Orders the jobs by cost, see <see cref="OrderByCost"/>; <see langword="null"/> for the gas hoist alone.</param>
+    private static void GroupTransactionsBySender(Block block, int maxWorkers, ISet<Hash256>? speculativelyWarmed, int[]? claimed, GroupingScratch scratch,
+        TransactionCostTable? costs = null)
     {
         Dictionary<AddressAsKey, ArrayPoolList<(int Index, Transaction Tx)>> groups = scratch.Groups;
         groups.Clear();
@@ -1338,6 +1346,12 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
             }
         }
 
+        if (costs is not null)
+        {
+            OrderByCost(result, costs);
+            return;
+        }
+
         // Hoist heavy jobs to the front (heaviest first): they take the longest to warm and gain
         // the most from lead time. The rest keep block order, which streams just ahead of the main
         // thread on transaction-dense blocks. First-index tie-breaks keep equal-estimate ordering
@@ -1352,6 +1366,78 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
             }
             return a.FirstIndex.CompareTo(b.FirstIndex);
         });
+    }
+
+    /// <summary>Block positions no job is moved ahead of for its learned cost.</summary>
+    /// <remarks>
+    /// On mainnet, block processing reaches positions 0-9 within about 1.3 ms of its first transaction (p50), only about
+    /// 0.3 ms after their warm runs start in block order, so their runs must start with the first workers; ten positions
+    /// still leave some of the first workers of a 16-core node to the costliest jobs.
+    /// </remarks>
+    internal const int CostOrderFrontLane = 10;
+
+    /// <summary>The learned cost, in milliseconds, from which a job is warmed ahead of block order.</summary>
+    /// <remarks>Lighter transactions still finish in time past the front lane when warmed in block order.</remarks>
+    internal const double CostOrderPromotionMs = 0.5;
+
+    /// <summary>Orders the jobs by what their transactions cost block processing when no warm run covered them.</summary>
+    /// <remarks>
+    /// <para>
+    /// The order, in tiers: the jobs the gas hoist lifts whose cost <paramref name="costs"/> does not know, heaviest first;
+    /// the front lane, the other jobs starting in the first <see cref="CostOrderFrontLane"/> positions, in block order;
+    /// past it, the jobs whose learned cost reaches <see cref="CostOrderPromotionMs"/>, costliest first; then the rest in
+    /// block order. A job's learned cost is the sum over its transactions the table knows, and the table is not asked
+    /// about the front lane. With an empty table this is the gas hoist's order.
+    /// </para>
+    /// <para>The order of the warm runs only; whether a footprint is taken over is decided as before.</para>
+    /// </remarks>
+    private static void OrderByCost(ArrayPoolList<WarmupJob> jobs, TransactionCostTable costs)
+    {
+        Span<WarmupJob> span = jobs.AsSpan();
+        long learned = 0;
+        long promoted = 0;
+        for (int i = 0; i < span.Length; i++)
+        {
+            ref WarmupJob job = ref span[i];
+            if (job.FirstIndex < CostOrderFrontLane || !TryGetCost(job.Transactions, costs, out double costMs)) continue;
+
+            job = new WarmupJob(job.Transactions, job.GasEstimate, costMs);
+            learned++;
+            if (job.IsPromoted) promoted++;
+        }
+
+        span.Sort(static (a, b) =>
+        {
+            int tier = a.CostTier;
+            int byTier = tier.CompareTo(b.CostTier);
+            if (byTier != 0) return byTier;
+            int byCost = tier switch
+            {
+                WarmupJob.HoistedTier => b.GasEstimate.CompareTo(a.GasEstimate),
+                WarmupJob.PromotedTier => b.CostMs.CompareTo(a.CostMs),
+                _ => 0
+            };
+            return byCost != 0 ? byCost : a.FirstIndex.CompareTo(b.FirstIndex);
+        });
+
+        Interlocked.Add(ref Blockchain.Metrics.PrewarmCostLearnedJobs, learned);
+        Interlocked.Add(ref Blockchain.Metrics.PrewarmCostFallbackJobs, span.Length - learned);
+        Interlocked.Add(ref Blockchain.Metrics.PrewarmCostPromotedJobs, promoted);
+        Blockchain.Metrics.PrewarmCostTableEntries = costs.Count;
+    }
+
+    private static bool TryGetCost(ArrayPoolList<(int Index, Transaction Tx)> transactions, TransactionCostTable costs, out double costMs)
+    {
+        bool known = false;
+        costMs = 0;
+        foreach ((int _, Transaction tx) in transactions.AsSpan())
+        {
+            if (!costs.TryGetCost(tx, out double txCostMs)) continue;
+            known = true;
+            costMs += txCostMs;
+        }
+
+        return known;
     }
 
     /// <summary>
@@ -1430,16 +1516,38 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
     /// with-copying would obscure ownership of the pooled transaction list.</remarks>
     internal readonly struct WarmupJob(
         ArrayPoolList<(int Index, Transaction Tx)> transactions,
-        ulong gasEstimate)
+        ulong gasEstimate,
+        double costMs = WarmupJob.UnknownCost)
     {
+        public const double UnknownCost = -1;
+        public const int HoistedTier = 0;
+        public const int FrontLaneTier = 1;
+        public const int PromotedTier = 2;
+        public const int BlockOrderTier = 3;
+
         public readonly ArrayPoolList<(int Index, Transaction Tx)> Transactions = transactions;
         /// <summary>Saturating aggregate of the declared gas limits (see <see cref="TotalGasLimit"/>).</summary>
         public readonly ulong GasEstimate = gasEstimate;
         /// <summary>Block position of the job's first transaction; also the hoist sort's tie-break.</summary>
         public readonly int FirstIndex = transactions[0].Index;
+        /// <summary>The learned cost in milliseconds (see <see cref="OrderByCost"/>), or <see cref="UnknownCost"/>.</summary>
+        public readonly double CostMs = costMs;
 
         public int LastIndex => Transactions[^1].Index;
         public bool IsHoisted => GasEstimate > SplitSenderGroupGasThreshold;
+        public bool HasCost => CostMs >= 0;
+        public bool IsPromoted => CostMs >= CostOrderPromotionMs;
+
+        /// <summary>The job's tier in <see cref="OrderByCost"/>.</summary>
+        public int CostTier
+        {
+            get
+            {
+                if (FirstIndex < CostOrderFrontLane) return IsHoisted ? HoistedTier : FrontLaneTier;
+                if (HasCost) return IsPromoted ? PromotedTier : BlockOrderTier;
+                return IsHoisted ? HoistedTier : BlockOrderTier;
+            }
+        }
     }
 
     private static bool AllSpeculativelyWarmed(ArrayPoolList<(int Index, Transaction Tx)> group, ISet<Hash256> warmed)
@@ -1703,6 +1811,9 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
 
     /// <summary>Whether the block's footprints take the writes of the transactions block processing executes.</summary>
     internal bool TakesExecutedWrites => Volatile.Read(ref _footprints) is not null;
+
+    /// <summary>What the transactions no warm run covered cost block processing; <see langword="null"/> unless the warm runs are ordered by it.</summary>
+    internal TransactionCostTable? CostTable => _costs;
 
     /// <summary>For tests.</summary>
     internal BlockFootprints? Footprints => Volatile.Read(ref _footprints);
@@ -2091,6 +2202,9 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
         /// <summary>For a mempool pass, where its runs' footprints go.</summary>
         public MempoolFootprints? Recording { get; set; }
 
+        /// <summary>For a block's warm pass, what orders its jobs by cost; <see langword="null"/> for the gas hoist alone.</summary>
+        public TransactionCostTable? Costs { get; set; }
+
         void IColdReadHandler.OnColdReads(int index, object? item) => PreWarmer.HandToDiscovery(index, (Transaction)item!, this);
 
         /// <summary>Created on the first hand-off: most blocks have none.</summary>
@@ -2224,7 +2338,7 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
             _waiter = 0;
             _active = 0;
             _helpers = 0;
-            GroupTransactionsBySender(blockState.Block, maxDegree, _speculativelyWarmed, claimed, _scratch);
+            GroupTransactionsBySender(blockState.Block, maxDegree, _speculativelyWarmed, claimed, _scratch, blockState.Costs);
             return _scratch.Jobs.Count + CountUnclaimed(claimed.AsSpan(0, txCount));
         }
 
