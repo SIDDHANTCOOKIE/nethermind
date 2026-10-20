@@ -1346,11 +1346,7 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
             }
         }
 
-        if (costs is not null)
-        {
-            OrderByCost(result, costs);
-            return;
-        }
+        if (costs is not null && OrderByCost(result, costs)) return;
 
         // Hoist heavy jobs to the front (heaviest first): they take the longest to warm and gain
         // the most from lead time. The rest keep block order, which streams just ahead of the main
@@ -1391,39 +1387,69 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
     /// </para>
     /// <para>The order of the warm runs only; whether a footprint is taken over is decided as before.</para>
     /// </remarks>
-    private static void OrderByCost(ArrayPoolList<WarmupJob> jobs, TransactionCostTable costs)
+    /// <returns><c>false</c> when the table knows no job past the front lane, which leaves the jobs to the gas hoist.</returns>
+    private static bool OrderByCost(ArrayPoolList<WarmupJob> jobs, TransactionCostTable costs)
     {
         Span<WarmupJob> span = jobs.AsSpan();
-        long learned = 0;
-        long promoted = 0;
-        for (int i = 0; i < span.Length; i++)
+        ulong[] keys = ArrayPool<ulong>.Shared.Rent(span.Length);
+        try
         {
-            ref WarmupJob job = ref span[i];
-            if (job.FirstIndex < CostOrderFrontLane || !TryGetCost(job.Transactions, costs, out double costMs)) continue;
-
-            job = new WarmupJob(job.Transactions, job.GasEstimate, costMs);
-            learned++;
-            if (job.IsPromoted) promoted++;
-        }
-
-        span.Sort(static (a, b) =>
-        {
-            int tier = a.CostTier;
-            int byTier = tier.CompareTo(b.CostTier);
-            if (byTier != 0) return byTier;
-            int byCost = tier switch
+            long learned = 0;
+            long promoted = 0;
+            for (int i = 0; i < span.Length; i++)
             {
-                WarmupJob.HoistedTier => b.GasEstimate.CompareTo(a.GasEstimate),
-                WarmupJob.PromotedTier => b.CostMs.CompareTo(a.CostMs),
-                _ => 0
-            };
-            return byCost != 0 ? byCost : a.FirstIndex.CompareTo(b.FirstIndex);
-        });
+                ref readonly WarmupJob job = ref span[i];
+                double costMs = job.FirstIndex >= CostOrderFrontLane && TryGetCost(job.Transactions, costs, out double known) ? known : -1;
+                if (costMs >= 0)
+                {
+                    learned++;
+                    if (costMs >= CostOrderPromotionMs) promoted++;
+                }
 
-        Interlocked.Add(ref Blockchain.Metrics.PrewarmCostLearnedJobs, learned);
-        Interlocked.Add(ref Blockchain.Metrics.PrewarmCostFallbackJobs, span.Length - learned);
-        Interlocked.Add(ref Blockchain.Metrics.PrewarmCostPromotedJobs, promoted);
-        Blockchain.Metrics.PrewarmCostTableEntries = costs.Count;
+                keys[i] = CostOrderKey(in job, costMs);
+            }
+
+            Interlocked.Add(ref Blockchain.Metrics.PrewarmCostLearnedJobs, learned);
+            Interlocked.Add(ref Blockchain.Metrics.PrewarmCostFallbackJobs, span.Length - learned);
+            Interlocked.Add(ref Blockchain.Metrics.PrewarmCostPromotedJobs, promoted);
+            Blockchain.Metrics.PrewarmCostTableEntries = costs.Count;
+            if (learned == 0) return false;
+
+            // Compared as numbers, the keys sort far faster than the jobs would through a comparison delegate.
+            keys.AsSpan(0, span.Length).Sort(span);
+            return true;
+        }
+        finally
+        {
+            ArrayPool<ulong>.Shared.Return(keys);
+        }
+    }
+
+    /// <summary>The place of <paramref name="job"/> in <see cref="OrderByCost"/>, as one number to sort ascending.</summary>
+    /// <param name="costMs">The job's learned cost; negative when none is known or the job is in the front lane.</param>
+    /// <remarks>
+    /// The tier in the top two bits; then, descending, the gas estimate in the gas hoist's tier and the learned cost in
+    /// nanoseconds in the promoted one, both capped at 40 bits (a trillion gas, 18 minutes); then the first position in
+    /// the low 22 bits. A cap only merges values no valid block holds.
+    /// </remarks>
+    private static ulong CostOrderKey(in WarmupJob job, double costMs)
+    {
+        const int indexBits = 22;
+        const ulong maxWeight = (1UL << 40) - 1;
+        const ulong hoisted = 0, frontLane = 1, promoted = 2, blockOrder = 3;
+
+        ulong tier;
+        if (job.FirstIndex < CostOrderFrontLane) tier = job.IsHoisted ? hoisted : frontLane;
+        else if (costMs >= 0) tier = costMs >= CostOrderPromotionMs ? promoted : blockOrder;
+        else tier = job.IsHoisted ? hoisted : blockOrder;
+
+        ulong weight = tier switch
+        {
+            hoisted => Math.Min(job.GasEstimate, maxWeight),
+            promoted => (ulong)Math.Min(costMs * 1_000_000, maxWeight),
+            _ => 0
+        };
+        return tier << 62 | (maxWeight - weight) << indexBits | Math.Min((ulong)job.FirstIndex, (1UL << indexBits) - 1);
     }
 
     private static bool TryGetCost(ArrayPoolList<(int Index, Transaction Tx)> transactions, TransactionCostTable costs, out double costMs)
@@ -1516,38 +1542,16 @@ public sealed class BlockCachePreWarmer : IBlockCachePreWarmer, IBlockProcessing
     /// with-copying would obscure ownership of the pooled transaction list.</remarks>
     internal readonly struct WarmupJob(
         ArrayPoolList<(int Index, Transaction Tx)> transactions,
-        ulong gasEstimate,
-        double costMs = WarmupJob.UnknownCost)
+        ulong gasEstimate)
     {
-        public const double UnknownCost = -1;
-        public const int HoistedTier = 0;
-        public const int FrontLaneTier = 1;
-        public const int PromotedTier = 2;
-        public const int BlockOrderTier = 3;
-
         public readonly ArrayPoolList<(int Index, Transaction Tx)> Transactions = transactions;
         /// <summary>Saturating aggregate of the declared gas limits (see <see cref="TotalGasLimit"/>).</summary>
         public readonly ulong GasEstimate = gasEstimate;
         /// <summary>Block position of the job's first transaction; also the hoist sort's tie-break.</summary>
         public readonly int FirstIndex = transactions[0].Index;
-        /// <summary>The learned cost in milliseconds (see <see cref="OrderByCost"/>), or <see cref="UnknownCost"/>.</summary>
-        public readonly double CostMs = costMs;
 
         public int LastIndex => Transactions[^1].Index;
         public bool IsHoisted => GasEstimate > SplitSenderGroupGasThreshold;
-        public bool HasCost => CostMs >= 0;
-        public bool IsPromoted => CostMs >= CostOrderPromotionMs;
-
-        /// <summary>The job's tier in <see cref="OrderByCost"/>.</summary>
-        public int CostTier
-        {
-            get
-            {
-                if (FirstIndex < CostOrderFrontLane) return IsHoisted ? HoistedTier : FrontLaneTier;
-                if (HasCost) return IsPromoted ? PromotedTier : BlockOrderTier;
-                return IsHoisted ? HoistedTier : BlockOrderTier;
-            }
-        }
     }
 
     private static bool AllSpeculativelyWarmed(ArrayPoolList<(int Index, Transaction Tx)> group, ISet<Hash256> warmed)

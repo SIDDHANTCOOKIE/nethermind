@@ -1789,15 +1789,24 @@ public class BlockCachePreWarmerTests(bool earlyStart)
     }
 
     [Test]
-    public void GroupTransactionsBySender_WithAnEmptyCostTable_OrdersAsTheGasHoist()
+    public void GroupTransactionsBySender_WithNoCostToActOn_OrdersAsTheGasHoist([Values] bool lightCostsLearned)
     {
         Block block = CostOrderBlock();
         int[] gasHoist = [11, 18, 1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16];
+        // Costs in the front lane, which is not asked, and below the promotion cost past it: nothing moves.
+        TransactionCostTable costs = new();
+        if (lightCostsLearned)
+        {
+            foreach ((int index, double ms) in new[] { (3, 9.0), (10, 0.4), (12, 0.1), (13, 0.2) })
+            {
+                costs.Learn(block.Transactions[index], TimeSpan.FromMilliseconds(ms));
+            }
+        }
 
         using (Assert.EnterMultipleScope())
         {
             Assert.That(JobOrder(block, costs: null), Is.EqualTo(gasHoist), "precondition: the gas hoist's order");
-            Assert.That(JobOrder(block, new TransactionCostTable()), Is.EqualTo(gasHoist));
+            Assert.That(JobOrder(block, costs), Is.EqualTo(gasHoist));
         }
     }
 
